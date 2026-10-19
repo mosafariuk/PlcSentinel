@@ -29,9 +29,13 @@ def run_ids_inspection(pcap_path="modbus_lab_traffic.pcap", authorized_ews_ip="1
         # MBAP & PDU fields
         trans_id = int.from_bytes(raw[0:2], "big")
         proto_id = int.from_bytes(raw[2:4], "big")
-        length = int.from_bytes(raw[4:6], "big")
         unit_id = raw[6]
         fc = raw[7]
+
+        # Modbus/TCP always carries Protocol ID 0; skip other TCP payloads so
+        # non-Modbus traffic on the segment does not generate false alerts.
+        if proto_id != 0:
+            continue
 
         src_ip = pkt["IP"].src
         dst_ip = pkt["IP"].dst

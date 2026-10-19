@@ -227,17 +227,12 @@ class S7DPIProxy:
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
-    def inspect_client_packet(self, data: bytes, client_ip: str, client_port: int) -> Tuple[bool, str]:
+    def evaluate_policy(self, parsed: Dict[str, Any], client_ip: str, client_port: int) -> Tuple[bool, str]:
         """
-        Layer-7 Policy Evaluation.
+        Layer-7 Policy Evaluation for a single, fully-framed S7comm PDU.
         Returns: (is_allowed: bool, reason: str)
         """
         self.stats["packets"] += 1
-        parsed = S7PacketParser.dissect(data)
-        if not parsed or not parsed.get("is_s7comm"):
-            # Non-S7comm payload (e.g. COTP handshake) -> ALLOW to complete ISO connection
-            return True, "COTP / Non-S7comm Handshake"
-
         fc = parsed.get("function_code")
         fc_name = parsed.get("function_name", "Unknown")
 
@@ -314,25 +309,70 @@ class S7DPIProxy:
         self.stats["allowed"] += 1
         return True, "ALLOW"
 
+    def _frame_client_stream(self, buf: bytes, client_ip: str, client_port: int) -> Tuple[bytes, bytes, Optional[str]]:
+        """Extract complete TPKT messages from the client byte stream and inspect each.
+
+        S7comm runs over ISO-on-TCP, a byte stream: a single read may hold several
+        TPKT messages or a partial one. We frame on the TPKT length field so every
+        complete S7 job is inspected before forwarding, and a partial message stays
+        buffered (never forwarded uninspected).
+
+        Returns (forwardable_bytes, remaining_buf, drop_reason). A non-None
+        drop_reason means fail closed: tear the session down.
+        """
+        out = b""
+        while len(buf) >= 4:
+            # Every legitimate S7/COTP frame is TPKT version 3.
+            if buf[0] != 0x03:
+                return out, buf, f"Non-TPKT byte 0x{buf[0]:02X} on S7 conduit"
+            tpkt_len = int.from_bytes(buf[2:4], "big")
+            if tpkt_len < 7 or tpkt_len > 4096:
+                return out, buf, f"Malformed TPKT length {tpkt_len}"
+            if len(buf) < tpkt_len:
+                break  # wait for the remainder of this message
+            msg, buf = buf[:tpkt_len], buf[tpkt_len:]
+
+            parsed = S7PacketParser.dissect(msg)
+            if parsed is None:
+                # A complete TPKT frame we cannot parse -> fail closed.
+                return out, buf, "Unparseable complete S7/COTP frame"
+            if not parsed.get("is_s7comm"):
+                # COTP handshake / non-S7 control frame -> allow ISO connection setup.
+                out += msg
+                continue
+
+            allowed, reason = self.evaluate_policy(parsed, client_ip, client_port)
+            if not allowed:
+                return out, buf, reason
+            out += msg
+        return out, buf, None
+
     async def pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, is_client: bool, client_ip: str, client_port: int):
         """Asynchronously pipes data between client and backend with Layer-7 DPI."""
+        buf = b""
         try:
             while not reader.at_eof():
                 data = await reader.read(4096)
                 if not data:
                     break
 
-                if is_client:
-                    allowed, reason = self.inspect_client_packet(data, client_ip, client_port)
-                    if not allowed:
-                        logger.warning(f"[BLOCKED] Inbound packet dropped! Reason: {reason}")
-                        # Immediately terminate connection to protect the PLC
-                        writer.close()
-                        await writer.wait_closed()
-                        return
+                if not is_client:
+                    # PLC -> client responses are forwarded unmodified.
+                    writer.write(data)
+                    await writer.drain()
+                    continue
 
-                writer.write(data)
-                await writer.drain()
+                buf += data
+                out, buf, drop_reason = self._frame_client_stream(buf, client_ip, client_port)
+                if out:
+                    writer.write(out)
+                    await writer.drain()
+                if drop_reason is not None:
+                    logger.warning(f"[BLOCKED] Inbound packet dropped! Reason: {drop_reason}")
+                    # Immediately terminate connection to protect the PLC
+                    writer.close()
+                    await writer.wait_closed()
+                    return
         except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
             pass
         finally:

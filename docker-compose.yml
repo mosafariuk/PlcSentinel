@@ -10,12 +10,14 @@ services:
     restart: unless-stopped
     ports:
       - "8081:8080"  # Web Dashboard (mapped to 8081 to prevent port 8080 collision)
-      - "502:502"    # Direct Modbus TCP
+      # Modbus TCP (502) is intentionally NOT published to the host: controllers
+      # are reachable only from the DPI gateway over the internal control net, so
+      # the Layer-7 conduit cannot be bypassed.
     networks:
       ot-control-net:
         ipv4_address: 10.0.1.10
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib2; urllib2.urlopen('http://127.0.0.1:8080/login')"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/login')"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -25,8 +27,8 @@ services:
     container_name: plcsentinel-s7-controller
     restart: unless-stopped
     command: python3 s7_mock_server.py --bind 0.0.0.0 --port 1102
-    ports:
-      - "1102:1102"  # Siemens S7comm Mock Controller
+    # S7comm (1102) is intentionally NOT published to the host: the controller is
+    # reachable only from the S7 DPI gateway over the internal control net.
     networks:
       ot-control-net:
         ipv4_address: 10.0.1.20
@@ -132,7 +134,12 @@ networks:
         - subnet: 192.168.1.0/24
           gateway: 192.168.1.1
 
-  # Level 1 Basic Control Network (Isolated Controller Bus)
+  # Level 1 Basic Control Network (Controller Bus).
+  # The control-protocol ports (Modbus 502, S7 1102) are deliberately NOT
+  # published to the host, so the only ingress to a controller is via the
+  # dual-homed DPI gateways. (A full air-gap via `internal: true` is avoided
+  # here because OpenPLC must publish its 8081 web UI for lab provisioning;
+  # publishing a port requires a non-internal network.)
   ot-control-net:
     driver: bridge
     internal: false

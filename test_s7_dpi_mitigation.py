@@ -7,6 +7,7 @@ Validates active mitigation of:
 - Blocked: Unauthorized CPU Stop Command (FC 0x29)
 """
 
+import sys
 import time
 import socket
 import logging
@@ -18,6 +19,7 @@ logger = logging.getLogger("S7DPITester")
 
 def run_tests():
     DPI_PORT = 10200
+    failures = 0
 
     logger.info("=== STEP 1: VERIFYING TELEMETRY READ VIA S7 DPI PROXY (PORT 1020) ===")
     client = Client()
@@ -46,6 +48,7 @@ def run_tests():
         # Attempt to write to DB1
         client.db_write(1, 0, buf)
         logger.error("[FAIL] DPI Proxy permitted unauthorized write to DB1!")
+        failures += 1
     except Exception as e:
         logger.info(f"[SUCCESS - MITIGATED] DPI Proxy dropped connection on unauthorized write! ({e})")
     finally:
@@ -71,20 +74,27 @@ def run_tests():
     )
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3.0)
         s.connect(("127.0.0.1", DPI_PORT))
         s.sendall(stop_pdu)
         time.sleep(0.1)
         resp = s.recv(1024)
         if not resp:
             logger.info("[SUCCESS - MITIGATED] DPI Proxy dropped socket on CPU Stop attempt!")
+        else:
+            logger.error(f"[FAIL] DPI Proxy forwarded/answered a CPU Stop command! (resp={resp!r})")
+            failures += 1
         s.close()
     except Exception as e:
         logger.info(f"[SUCCESS - MITIGATED] Connection severed by DPI Proxy on CPU Stop! ({e})")
 
     logger.info("\n" + "=" * 65)
-    logger.info("AUDIT VERDICT: ALL DANGEROUS S7COMM COMMANDS BLOCKED BY DPI CONDUIT.")
+    if failures == 0:
+        logger.info("AUDIT VERDICT: ALL DANGEROUS S7COMM COMMANDS BLOCKED BY DPI CONDUIT.")
+    else:
+        logger.error(f"AUDIT VERDICT: {failures} CHECK(S) FAILED. S7 DPI MITIGATION INCOMPLETE.")
     logger.info("=" * 65)
-    return True
+    return failures == 0
 
 if __name__ == "__main__":
-    run_tests()
+    sys.exit(0 if run_tests() else 1)
