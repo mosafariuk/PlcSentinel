@@ -29,6 +29,11 @@ async def run_client(use_encryption=True):
             private_key="certs/opcua_client_key.pem",
             server_certificate="certs/opcua_server_cert.der"
         )
+        # Authenticate the USER identity with the same X.509 certificate so the
+        # server (which requires a trusted certificate identity) accepts us. This
+        # is the client half of mutual authentication.
+        await client.load_client_certificate("certs/opcua_client_cert.der")
+        await client.load_private_key("certs/opcua_client_key.pem")
     else:
         logger.warning("[WARN] Connecting with NoSecurity (Cleartext mode)...")
 
