@@ -1,0 +1,125 @@
+version: "3.8"
+
+services:
+  # ============================================================================
+  # LEVEL 1: BASIC PROCESS CONTROL ZONE (CONTROLLERS)
+  # ============================================================================
+
+  openplc:
+    image: fdamador/openplc:latest
+    platform: linux/amd64
+    container_name: plcsentinel-openplc
+    restart: unless-stopped
+    ports:
+      - "8081:8080"  # Web Dashboard (mapped to 8081 to prevent port 8080 collision)
+      - "502:502"    # Direct Modbus TCP
+    networks:
+      ot-control-net:
+        ipv4_address: 10.0.1.10
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/login"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  s7-mock-server:
+    build: .
+    container_name: plcsentinel-s7-controller
+    restart: unless-stopped
+    command: python3 s7_mock_server.py
+    ports:
+      - "1102:1102"  # Siemens S7comm Mock Controller
+    networks:
+      ot-control-net:
+        ipv4_address: 10.0.1.20
+
+  opcua-secure-server:
+    build: .
+    container_name: plcsentinel-opcua-server
+    restart: unless-stopped
+    command: >
+      sh -c "python3 generate_opcua_certs.py &&
+             python3 opcua_secure_server.py"
+    ports:
+      - "4840:4840"  # Encrypted OPC UA Server (IEC 62541)
+    volumes:
+      - ./certs:/app/certs
+    networks:
+      ot-supervisory-net:
+        ipv4_address: 192.168.1.40
+
+  # ============================================================================
+  # CONDUIT C-1: LAYER-7 DEEP PACKET INSPECTION GATEWAYS
+  # ============================================================================
+
+  modbus-dpi-proxy:
+    build: .
+    container_name: plcsentinel-modbus-dpi
+    restart: unless-stopped
+    command: >
+      python3 modbus_dpi_proxy.py
+      --listen-port 5020
+      --backend-host 10.0.1.10
+      --backend-port 502
+      --authorized-ip 192.168.1.50
+      --log-file /app/logs/ot_security_events.jsonl
+    ports:
+      - "5020:5020"  # Sanitized Modbus TCP Gateway
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      openplc:
+        condition: service_started
+    networks:
+      ot-supervisory-net:
+        ipv4_address: 192.168.1.100
+      ot-control-net:
+        ipv4_address: 10.0.1.100
+
+  s7-dpi-proxy:
+    build: .
+    container_name: plcsentinel-s7-dpi
+    restart: unless-stopped
+    command: >
+      python3 s7_dpi_proxy.py
+      --listen-port 10200
+      --backend-host 10.0.1.20
+      --backend-port 1102
+      --authorized-ews 192.168.1.50
+      --log-file /app/logs/s7_security_events.jsonl
+    ports:
+      - "10200:10200" # Sanitized Siemens S7comm Gateway
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      s7-mock-server:
+        condition: service_started
+    networks:
+      ot-supervisory-net:
+        ipv4_address: 192.168.1.101
+      ot-control-net:
+        ipv4_address: 10.0.1.101
+
+# ==============================================================================
+# NETWORK BRIDGING & SEGMENTATION (PURDUE MODEL / IEC 62443-3-2)
+# ==============================================================================
+
+networks:
+  # Level 2 Supervisory Network (HMI / Engineering Workstations)
+  ot-supervisory-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.1.0/24
+          gateway: 192.168.1.1
+
+  # Level 1 Basic Control Network (Isolated Controller Bus)
+  ot-control-net:
+    driver: bridge
+    internal: false
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.0.1.0/24
+          gateway: 10.0.1.1
