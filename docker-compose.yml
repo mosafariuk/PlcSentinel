@@ -17,10 +17,13 @@ services:
       ot-control-net:
         ipv4_address: 10.0.1.10
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/login')"]
+      # The fdamador/openplc image ships Python 2.7 only (no python3/curl/wget),
+      # so the probe must use `python` + urllib2.
+      test: ["CMD", "python", "-c", "import urllib2; urllib2.urlopen('http://127.0.0.1:8080/login')"]
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 30s
 
   s7-mock-server:
     build: .
