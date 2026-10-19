@@ -87,5 +87,21 @@ def render_unified_dashboard(events):
     print("+" + "=" * 78 + "+")
 
 if __name__ == "__main__":
-    evts = load_all_events()
-    render_unified_dashboard(evts)
+    import argparse
+    import time
+    parser = argparse.ArgumentParser(description="PlcSentinel OT SOC Dashboard")
+    parser.add_argument("--watch", action="store_true", help="Continuously refresh dashboard")
+    parser.add_argument("--interval", type=int, default=5, help="Refresh interval in seconds (default: 5)")
+    args = parser.parse_args()
+
+    if args.watch:
+        try:
+            while True:
+                evts = load_all_events()
+                render_unified_dashboard(evts)
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\nDashboard monitoring stopped.")
+    else:
+        evts = load_all_events()
+        render_unified_dashboard(evts)

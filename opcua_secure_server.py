@@ -20,7 +20,7 @@ async def main():
     server = Server()
     await server.init()
 
-    endpoint = "opc.tcp://127.0.0.1:4840/plcsentinel/server/"
+    endpoint = "opc.tcp://0.0.0.0:4840/plcsentinel/server/"
     server.set_endpoint(endpoint)
     server.set_server_name("PlcSentinel Secure OPC UA Substation")
 

@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+*.pcap
+logs/*.jsonl
+.DS_Store

@@ -264,14 +264,18 @@ class ModbusDPIProxy:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Modbus Layer-7 DPI Gateway Proxy with SIEM Logging")
-    parser.add_argument("--listen-port", type=int, default=5020)
-    parser.add_argument("--backend-port", type=int, default=502)
-    parser.add_argument("--authorized-ip", type=str, default="192.168.1.50")
-    parser.add_argument("--log-file", type=str, default="logs/ot_security_events.jsonl")
+    parser.add_argument("--listen-host", type=str, default="0.0.0.0", help="Listen address (default: 0.0.0.0)")
+    parser.add_argument("--listen-port", type=int, default=5020, help="Listen port (default: 5020)")
+    parser.add_argument("--backend-host", type=str, default="127.0.0.1", help="Backend PLC IP (default: 127.0.0.1)")
+    parser.add_argument("--backend-port", type=int, default=502, help="Backend PLC port (default: 502)")
+    parser.add_argument("--authorized-ip", type=str, default="192.168.1.50", help="Authorized EWS IP (default: 192.168.1.50)")
+    parser.add_argument("--log-file", type=str, default="logs/ot_security_events.jsonl", help="SIEM event log path")
     args = parser.parse_args()
 
     proxy = ModbusDPIProxy(
+        listen_host=args.listen_host,
         listen_port=args.listen_port,
+        backend_host=args.backend_host,
         backend_port=args.backend_port,
         authorized_ews_ip=args.authorized_ip,
         log_file=args.log_file
