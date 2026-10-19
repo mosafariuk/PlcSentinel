@@ -6,6 +6,7 @@ SHELL := /bin/bash
 VENV  := .venv
 PY    := $(VENV)/bin/python3
 PIP   := $(VENV)/bin/pip
+COMPOSE ?= $(shell if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; else echo "docker compose"; fi)
 
 .PHONY: help setup venv clean test-all test-modbus test-s7 test-opcua \
         run-modbus-lab run-s7-lab run-opcua-lab soc read-modbus read-s7 \
@@ -80,13 +81,19 @@ test-all: test-modbus test-s7 test-opcua ## Run all three protocol test suites s
 # DOCKER COMPOSE ORCHESTRATION
 # ------------------------------------------------------------------------------
 docker-up: ## Build and start the entire multi-protocol testbed with Docker Compose
-	@docker compose up -d --build
+	@docker stop openplc-sandbox 2>/dev/null || true
+	@$(COMPOSE) up -d --build
+	@sleep 4
+	@$(PY) init_openplc.py http://127.0.0.1:8081 2>/dev/null || true
 
 docker-down: ## Tear down all Docker Compose services and networks
-	@docker compose down
+	@$(COMPOSE) down
 
 docker-logs: ## Follow live logs from all Docker Compose services
-	@docker compose logs -f
+	@$(COMPOSE) logs -f
+
+init-openplc: ## Compile and start tank_control.st in OpenPLC
+	@$(PY) init_openplc.py http://127.0.0.1:8081
 
 # ------------------------------------------------------------------------------
 # CLEANUP

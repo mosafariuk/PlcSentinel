@@ -16,7 +16,7 @@ from snap7.util import set_int, set_real, set_bool
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [S7-MOCK-SERVER] %(message)s")
 logger = logging.getLogger("S7MockServer")
 
-def run_mock_s7_server(port=1102):
+def run_mock_s7_server(bind_address="0.0.0.0", port=1102):
     server = Server()
 
     # 1. Allocate & Initialize DB1 memory (100 bytes)
@@ -36,8 +36,8 @@ def run_mock_s7_server(port=1102):
     server.register_area(snap7.SrvArea.DB, 1, db1_data)
     server.register_area(snap7.SrvArea.MK, 0, mk_data)
 
-    logger.info(f"Starting Siemens S7 Mock Controller on 127.0.0.1:{port}...")
-    server.start_to("127.0.0.1", tcp_port=port)
+    logger.info(f"Starting Siemens S7 Mock Controller on {bind_address}:{port}...")
+    server.start_to(bind_address, tcp_port=port)
     logger.info("Mock Controller is in RUN mode. Ready for S7comm client connections.")
 
     try:
@@ -50,4 +50,9 @@ def run_mock_s7_server(port=1102):
         server.destroy()
 
 if __name__ == "__main__":
-    run_mock_s7_server(port=1102)
+    import argparse
+    parser = argparse.ArgumentParser(description="PlcSentinel Siemens S7 Mock Controller")
+    parser.add_argument("--bind", type=str, default="0.0.0.0", help="Bind IP address (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=1102, help="Port to listen on (default: 1102)")
+    args = parser.parse_args()
+    run_mock_s7_server(bind_address=args.bind, port=args.port)
