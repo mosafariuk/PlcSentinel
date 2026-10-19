@@ -1,0 +1,50 @@
+# ==============================================================================
+# PlcSentinel: Wireshark Display Filters & Color Rules for Modbus TCP
+# ==============================================================================
+
+# 1. BASE PROTOCOL INSPECTION
+# Show all Modbus Application Protocol frames
+mbtcp
+
+# Show all Modbus traffic on port 502
+tcp.port == 502
+
+# 2. ISOLATING FUNCTION CODES
+# Telemetry Reads:
+modbus.func_code == 1    # Read Coils (Actuator States: Pump, Valves)
+modbus.func_code == 2    # Read Discrete Inputs (Sensors: Low/High/E-Stop)
+modbus.func_code == 3    # Read Holding Registers (Threshold Setpoints)
+modbus.func_code == 4    # Read Input Registers (Raw Analog Level)
+
+# Control Writes:
+modbus.func_code == 5    # Write Single Coil (Force Actuator state)
+modbus.func_code == 6    # Write Single Register (Modify Single Setpoint)
+modbus.func_code == 15   # Write Multiple Coils (Bulk Actuator Force)
+modbus.func_code == 16   # Write Multiple Registers (Bulk Setpoint Injection)
+
+# 3. ANOMALY & THREAT HUNTING FILTERS
+# Show any Modbus write attempt (FC 05, 06, 15, 16)
+modbus.func_code in {5 6 15 16}
+
+# Show write attempts originating outside the Engineering Workstation IP (e.g. 192.168.1.50)
+tcp.dstport == 502 && ip.src != 192.168.1.50 && modbus.func_code in {5 6 15 16}
+
+# Identify all Modbus Exception Responses (High bit set: FC >= 0x80)
+modbus.exception_code || modbus.func_code >= 128
+
+# Filter for specific exception: Illegal Data Address (Exception 0x02)
+modbus.exception_code == 2
+
+# Filter for specific exception: Illegal Function Code (Exception 0x01)
+modbus.exception_code == 1
+
+# Filter for high tank level threshold tampering (> 900)
+modbus.func_code == 6 && modbus.reference_num == 0 && modbus.data_value > 900
+
+# 4. RECOMMENDED WIRESHARK COLORING RULES
+# Rule 1: "Modbus Writes"
+#   Filter: modbus.func_code in {5 6 15 16}
+#   Foreground: #FFFFFF | Background: #FF5555 (Red alert for write operations)
+# Rule 2: "Modbus Exceptions"
+#   Filter: modbus.exception_code
+#   Foreground: #000000 | Background: #FFAA00 (Orange warning for error responses)

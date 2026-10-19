@@ -1,0 +1,19 @@
+# Python virtual environments & bytecode
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local IDE configuration
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Transient log captures (keep directory structure)
+*.log
