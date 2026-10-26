@@ -46,7 +46,7 @@
                                       ||
 +---------------------------------------------------------------------------------+
 | PROCESS ZONE (Level 0)                                                          |
-| - Sensors: Float Switches (%IX0.0, %IX0.1), Analog Level Probe (%IW0)           |
+| - Sensors: Float Switches (%IX0.0, %IX0.1), Analog Level Probe (%QW2)           |
 | - Actuators: Inflow Pump Contactor (%QX0.0), Emergency Drain Valve (%QX0.1)     |
 +---------------------------------------------------------------------------------+
 ```
@@ -104,5 +104,5 @@ iptables -A INPUT -p tcp --dport 8080 -j DROP
 ## 4. Hardware Safety Decoupling (The Golden Rule of ICS Defense)
 
 Software controls, network segmentation, and encryption **must never be the sole line of defense against loss of life or containment breaches**.
-* **Hardwired Interlocks (Level 0):** The High-Level Float switch (`%IX0.1`) and Emergency Stop (`%IX0.2`) must be physically wired in series with the inflow pump contactor coil power supply.
+* **Hardwired Interlocks (Level 0):** The High-Level Float switch (`%IX0.1`) and Emergency Stop (`%QX0.4`) must be physically wired in series with the inflow pump contactor coil power supply.
 * If an attacker compromises the PLC firmware or executes setpoint poisoning (writing `9999`), the physical circuit breaks as soon as water trips the mechanical float, cutting power to the pump regardless of corrupted software memory.

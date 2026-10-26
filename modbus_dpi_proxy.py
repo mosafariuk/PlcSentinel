@@ -15,6 +15,7 @@ import socket
 import select
 import logging
 import argparse
+import threading
 from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any
 
@@ -40,6 +41,10 @@ FC_NAMES = {
     15: "Write Multiple Coils",
     16: "Write Multiple Registers",
 }
+
+# Holding registers 0 (High) and 1 (Low) are the tank setpoints, both scaled
+# 0..1000; neither may be pushed above the safe capacity threshold.
+PROTECTED_SETPOINT_REGS = (0, 1)
 
 class ModbusDPIProxy:
     def __init__(
@@ -117,6 +122,33 @@ class ModbusDPIProxy:
         pdu = bytes([orig_fc | 0x80, exc_code])
         return mbap + pdu
 
+    def _check_setpoint_hazard(self, fc: int, raw_pkt: bytes) -> Optional[Tuple[int, int]]:
+        """Return (register, value) if a write pushes a protected setpoint
+        register (PROTECTED_SETPOINT_REGS) above the safe threshold, else None.
+
+        Handles both FC6 (Write Single Register) and FC16 (Write Multiple
+        Registers); FC16 can address a protected register inside a larger
+        block, so the whole written range is scanned.
+        """
+        if fc == 6 and len(raw_pkt) >= 12:
+            reg_addr = int.from_bytes(raw_pkt[8:10], "big")
+            reg_val = int.from_bytes(raw_pkt[10:12], "big")
+            if reg_addr in PROTECTED_SETPOINT_REGS and reg_val > self.max_safe_high_threshold:
+                return reg_addr, reg_val
+        elif fc == 16 and len(raw_pkt) >= 13:
+            start_addr = int.from_bytes(raw_pkt[8:10], "big")
+            qty = int.from_bytes(raw_pkt[10:12], "big")
+            byte_count = raw_pkt[12]
+            for reg in PROTECTED_SETPOINT_REGS:
+                if not (start_addr <= reg < start_addr + qty):
+                    continue
+                off = 13 + (reg - start_addr) * 2
+                if off + 2 <= len(raw_pkt) and (off - 13) < byte_count:
+                    reg_val = int.from_bytes(raw_pkt[off:off + 2], "big")
+                    if reg_val > self.max_safe_high_threshold:
+                        return reg, reg_val
+        return None
+
     def inspect_request(self, raw_pkt: bytes, client_ip: str, client_port: int) -> Tuple[bool, Optional[bytes], str]:
         self.stats["inspected"] += 1
         if len(raw_pkt) < 8:
@@ -161,33 +193,34 @@ class ModbusDPIProxy:
 
         # ----------------------------------------------------------------------
         # TIER 2: Semantic Process Boundary Inspection
+        # Covers both Write Single Register (FC6) and Write Multiple Registers
+        # (FC16) so the protected high-setpoint register cannot be poisoned via
+        # the bulk-write path.
         # ----------------------------------------------------------------------
-        if fc == 6 and len(raw_pkt) >= 12:
-            reg_addr = int.from_bytes(raw_pkt[8:10], "big")
-            reg_val = int.from_bytes(raw_pkt[10:12], "big")
+        hazard = self._check_setpoint_hazard(fc, raw_pkt)
+        if hazard is not None:
+            reg_addr, reg_val = hazard
+            self.stats["blocked"] += 1
+            reason = (
+                f"CRITICAL PROCESS HAZARD: High Setpoint {reg_val} exceeds safe capacity "
+                f"({self.max_safe_high_threshold}). Potential loss-of-containment attack."
+            )
+            exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_DATA_VALUE)
 
-            if reg_addr == 0 and reg_val > self.max_safe_high_threshold:
-                self.stats["blocked"] += 1
-                reason = (
-                    f"CRITICAL PROCESS HAZARD: High Setpoint {reg_val} exceeds safe capacity "
-                    f"({self.max_safe_high_threshold}). Potential loss-of-containment attack."
-                )
-                exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_DATA_VALUE)
-
-                self.emit_siem_event(
-                    action="blocked",
-                    severity="critical",
-                    reason=reason,
-                    client_ip=client_ip,
-                    client_port=client_port,
-                    trans_id=trans_id,
-                    unit_id=unit_id,
-                    fc=fc,
-                    mitre_technique_id="T0836",
-                    mitre_technique_name="Modify Parameter",
-                    payload_details={"target_register": reg_addr, "attempted_value": reg_val, "safe_limit": self.max_safe_high_threshold}
-                )
-                return False, exc_resp, reason
+            self.emit_siem_event(
+                action="blocked",
+                severity="critical",
+                reason=reason,
+                client_ip=client_ip,
+                client_port=client_port,
+                trans_id=trans_id,
+                unit_id=unit_id,
+                fc=fc,
+                mitre_technique_id="T0836",
+                mitre_technique_name="Modify Parameter",
+                payload_details={"target_register": reg_addr, "attempted_value": reg_val, "safe_limit": self.max_safe_high_threshold}
+            )
+            return False, exc_resp, reason
 
         # Allowed Operation
         self.stats["allowed"] += 1
@@ -217,6 +250,7 @@ class ModbusDPIProxy:
             client_sock.close()
             return
 
+        client_buf = b""
         sockets = [client_sock, backend_sock]
         try:
             while True:
@@ -232,18 +266,55 @@ class ModbusDPIProxy:
                         return
 
                     if sock is client_sock:
-                        is_allowed, synthetic_resp, reason = self.inspect_request(data, client_ip, client_port)
-                        if is_allowed:
-                            backend_sock.sendall(data)
-                        else:
-                            logger.warning(f"[BLOCKED] Packet dropped! Reason: {reason}")
-                            if synthetic_resp:
-                                client_sock.sendall(synthetic_resp)
+                        # Modbus/TCP is a byte stream: a single recv may hold
+                        # several ADUs (pipelining) or a partial one. Frame on the
+                        # MBAP length field and inspect every complete ADU before
+                        # forwarding it, so nothing reaches the PLC uninspected.
+                        client_buf += data
+                        client_buf = self._process_client_stream(
+                            client_buf, client_sock, backend_sock, client_ip, client_port
+                        )
+                        if client_buf is None:
+                            return
                     else:
                         client_sock.sendall(data)
         finally:
             client_sock.close()
             backend_sock.close()
+
+    def _process_client_stream(
+        self,
+        buf: bytes,
+        client_sock: socket.socket,
+        backend_sock: socket.socket,
+        client_ip: str,
+        client_port: int,
+    ) -> Optional[bytes]:
+        """Extract and inspect complete Modbus ADUs from the client byte stream.
+
+        Returns the unconsumed tail (a partial ADU awaiting more bytes), or None
+        to signal the session must be torn down (fail-closed on a malformed MBAP).
+        """
+        while len(buf) >= 6:
+            length = int.from_bytes(buf[4:6], "big")
+            # MBAP length counts unit id + PDU; bound it to reject garbage/smuggling.
+            if length < 2 or length > 253:
+                logger.warning(
+                    f"[BLOCKED] Malformed MBAP length={length} from {client_ip}; dropping session"
+                )
+                return None
+            total = 6 + length
+            if len(buf) < total:
+                break  # wait for the remainder of this ADU
+            adu, buf = buf[:total], buf[total:]
+            is_allowed, synthetic_resp, reason = self.inspect_request(adu, client_ip, client_port)
+            if is_allowed:
+                backend_sock.sendall(adu)
+            else:
+                logger.warning(f"[BLOCKED] Packet dropped! Reason: {reason}")
+                if synthetic_resp:
+                    client_sock.sendall(synthetic_resp)
+        return buf
 
     def start_proxy(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -258,7 +329,13 @@ class ModbusDPIProxy:
         try:
             while True:
                 client_sock, client_addr = server.accept()
-                self.handle_client_session(client_sock, client_addr)
+                # One thread per session so a slow or idle client cannot block
+                # inspection of every other connection.
+                threading.Thread(
+                    target=self.handle_client_session,
+                    args=(client_sock, client_addr),
+                    daemon=True,
+                ).start()
         finally:
             server.close()
 

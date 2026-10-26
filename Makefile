@@ -8,7 +8,7 @@ PY    := $(VENV)/bin/python3
 PIP   := $(VENV)/bin/pip
 COMPOSE ?= $(shell if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; else echo "docker compose"; fi)
 
-.PHONY: help setup venv clean test-all test-modbus test-s7 test-opcua \
+.PHONY: help setup venv clean test-all test-unit test-modbus test-s7 test-opcua test-ews \
         run-modbus-lab run-s7-lab run-opcua-lab soc read-modbus read-s7 \
         docker-up docker-down docker-logs
 
@@ -63,6 +63,9 @@ hmi: ## Run terminal-based supervisory HMI console
 # ------------------------------------------------------------------------------
 # AUTOMATED THREAT MITIGATION TESTS
 # ------------------------------------------------------------------------------
+test-unit: ## Run offline DPI policy unit tests (no PLC, proxies or venv extras needed)
+	@$(PY) -m unittest -v test_dpi_policy
+
 test-modbus: ## Execute automated Modbus DPI threat mitigation tests
 	@$(PY) test_dpi_firewall.py
 
@@ -72,7 +75,12 @@ test-s7: ## Execute automated S7comm CPU Stop and Write mitigation tests
 test-opcua: ## Execute encrypted OPC UA mutual-TLS telemetry test
 	@$(PY) opcua_secure_client.py
 
-test-all: test-modbus test-s7 test-opcua ## Run all three protocol test suites sequentially
+test-ews: ## Prove the authorized-EWS write path through both gateways (needs make docker-up)
+	@if $(COMPOSE) ps --status running --services 2>/dev/null | grep -qx ews; then \
+		$(COMPOSE) exec -T ews python3 test_ews_authorized.py; \
+	else echo "[!] ews container not running (make docker-up); skipping authorized-path test"; fi
+
+test-all: test-unit test-modbus test-s7 test-opcua test-ews ## Run offline unit tests, the three protocol suites, then the authorized-EWS path
 	@echo "======================================================================"
 	@echo "       ALL INDUSTRIAL THREAT MITIGATION TESTS PASSED SUCCESSFULLY!    "
 	@echo "======================================================================"
