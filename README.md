@@ -55,6 +55,7 @@
    * Note: the Modbus/S7 conduits authorize by **source IP** — a compensating control for unauthenticated legacy protocols, not a cryptographic identity. OPC UA is the mutually-authenticated path.
 3. **Unified OT SOC Threat Dashboard:**
    * Console-based SIEM dashboard ([soc_dashboard.py](soc_dashboard.py)) streaming structured **Elastic Common Schema (ECS)** logs enriched with MITRE ATT&CK for ICS tags (`T0855`, `T0836`, `T0805`).
+   * `--siem-udp HOST:PORT` on either gateway also forwards every event as a JSON datagram to an Elastic, Logstash or Wazuh collector, so no shared log volume is needed.
 4. **Complete Technical Documentation:**
    * [ARTICLE_PlcSentinel_ICS_Security.md](ARTICLE_PlcSentinel_ICS_Security.md): Full publication-grade whitepaper.
    * [PlcSentinel_Lab_Guide.md](PlcSentinel_Lab_Guide.md): 7-Day structured hands-on curriculum.
