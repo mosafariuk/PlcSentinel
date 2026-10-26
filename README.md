@@ -51,6 +51,7 @@
    * Enforces semantic process safety boundaries (e.g. overfill protection thresholds).
    * Policy lives in `modbus_policy.json` / `s7_policy.json` (authorized stations, open function codes, protected registers and their limits), validated at startup; CLI flags override it.
    * Per-source caps on concurrent sessions and requests per second (policy keys `max_sessions_per_source`, `max_requests_per_second`) stop one host exhausting the controller's connection table through the gateway; they apply in both modes and log MITRE T0814 events.
+   * For protocols without a dedicated gateway yet (EtherNet/IP, Unitronics PCOM, vendor engineering protocols), [tls_conduit.py](tls_conduit.py) is an identity-gated conduit: mutual TLS, certificate allow list, per-source caps and ECS logging, then a byte-for-byte relay. Authentication without inspection, which still removes the controller's exposure.
    * `--monitor` runs either gateway inline in detect-only mode: violations are logged as `detected` and forwarded, so a site can observe before enforcing.
    * Authorization is by **principal**: a source IP on the plain listeners (a compensating control for legacy stations) or, on the mutual-TLS listeners (Modbus/TCP Security on 802, S7 on 10202), the **Common Name of a client certificate** issued by the lab CA. Engineering tools that cannot speak TLS reach the S7 gateway through [ews_tls_tunnel.py](ews_tls_tunnel.py). The controller side stays plain: the conduit terminates the identity.
 3. **Unified OT SOC Threat Dashboard:**
@@ -151,6 +152,7 @@ PlcSentinel/
 ├── generate_gateway_certs.py            # Lab CA, gateway and EWS certificates for the mutual-TLS conduits
 ├── dpi_tls.py                           # Mutual-TLS helpers shared by the gateways and the EWS tunnel
 ├── ews_tls_tunnel.py                    # EWS-side tunnel: local plain port -> mutual TLS -> gateway
+├── tls_conduit.py                       # Identity-gated relay for protocols without a dedicated gateway
 ├── opcua_secure_server.py               # IEC 62541 Secure OPC UA server
 ├── opcua_secure_client.py               # Mutual X.509 authenticated OPC UA client
 ├── opcua_vs_modbus.py                   # Protocol security comparison matrix
