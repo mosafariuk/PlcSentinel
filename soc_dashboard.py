@@ -17,6 +17,7 @@ LOG_FILES = [
     "logs/ot_security_events.jsonl",
     "logs/s7_security_events.jsonl",
     "logs/conduit_events.jsonl",
+    "logs/iec104_security_events.jsonl",
 ]
 
 def load_all_events():
