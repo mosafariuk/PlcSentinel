@@ -135,6 +135,7 @@ PlcSentinel/
 ├── read_via_proxy.py                    # Telemetry reader via Modbus DPI proxy
 ├── test_dpi_firewall.py                 # Automated Modbus mitigation test suite
 ├── test_dpi_policy.py                   # Offline unit tests for both DPI policy engines (no services needed)
+├── test_dpi_identity.py                 # Mutual-TLS identity tests (mints a throwaway PKI per run)
 ├── test_ews_authorized.py               # Authorized-EWS write path test, run inside the ews container
 ├── ot_attack_suite.py                   # MITRE ATT&CK for ICS exploit simulation
 ├── hmi_monitor.py                       # Terminal-based supervisory HMI console
@@ -146,6 +147,8 @@ PlcSentinel/
 ├── s7_policy.json                       # S7 gateway policy: authorized EWS, open jobs and UserData
 ├── test_s7_dpi_mitigation.py            # S7 DPI mitigation test suite
 ├── generate_opcua_certs.py              # X.509 RSA PKI certificate generator
+├── generate_gateway_certs.py            # Lab CA, gateway and EWS certificates for the mutual-TLS conduits
+├── dpi_tls.py                           # Mutual-TLS helpers shared by the gateways and the EWS tunnel
 ├── opcua_secure_server.py               # IEC 62541 Secure OPC UA server
 ├── opcua_secure_client.py               # Mutual X.509 authenticated OPC UA client
 ├── opcua_vs_modbus.py                   # Protocol security comparison matrix
