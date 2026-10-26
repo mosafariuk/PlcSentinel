@@ -77,6 +77,22 @@ services:
         ipv4_address: 192.168.1.40
 
   # ============================================================================
+  # LAB PKI: one-shot service that mints the CA, gateway and EWS certificates
+  # into ./certs (kept if already present). The gateways wait for it.
+  # ============================================================================
+
+  gateway-pki:
+    build: .
+    container_name: plcsentinel-gateway-pki
+    <<: *hardened
+    restart: "no"
+    command: python3 generate_gateway_certs.py --if-missing
+    volumes:
+      - ./certs:/app/certs
+    networks:
+      - ot-supervisory-net
+
+  # ============================================================================
   # CONDUIT C-1: LAYER-7 DEEP PACKET INSPECTION GATEWAYS
   # ============================================================================
 
@@ -97,14 +113,19 @@ services:
       --backend-host 10.0.1.10
       --backend-port 502
       --policy modbus_policy.json
+      --tls-port 802
       --log-file /app/logs/ot_security_events.jsonl
     ports:
-      - "5020:5020"  # Sanitized Modbus TCP Gateway
+      - "5020:5020"  # Sanitized Modbus TCP Gateway (source-address policy)
+      - "802:802"    # Modbus/TCP Security: mutual TLS, certificate identity
     volumes:
       - ./logs:/app/logs
+      - ./certs:/app/certs:ro
     depends_on:
       openplc:
         condition: service_started
+      gateway-pki:
+        condition: service_completed_successfully
     networks:
       ot-supervisory-net:
         ipv4_address: 192.168.1.100
@@ -128,14 +149,19 @@ services:
       --backend-host 10.0.1.20
       --backend-port 1102
       --policy s7_policy.json
+      --tls-port 10202
       --log-file /app/logs/s7_security_events.jsonl
     ports:
-      - "10200:10200" # Sanitized Siemens S7comm Gateway
+      - "10200:10200" # Sanitized Siemens S7comm Gateway (source-address policy)
+      - "10202:10202" # Mutual-TLS listener for ews_tls_tunnel.py, certificate identity
     volumes:
       - ./logs:/app/logs
+      - ./certs:/app/certs:ro
     depends_on:
       s7-mock-server:
         condition: service_started
+      gateway-pki:
+        condition: service_completed_successfully
     networks:
       ot-supervisory-net:
         ipv4_address: 192.168.1.101
