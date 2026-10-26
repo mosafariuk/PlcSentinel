@@ -52,7 +52,7 @@
    * Policy lives in `modbus_policy.json` / `s7_policy.json` (authorized stations, open function codes, protected registers and their limits), validated at startup; CLI flags override it.
    * Per-source caps on concurrent sessions and requests per second (policy keys `max_sessions_per_source`, `max_requests_per_second`) stop one host exhausting the controller's connection table through the gateway; they apply in both modes and log MITRE T0814 events.
    * `--monitor` runs either gateway inline in detect-only mode: violations are logged as `detected` and forwarded, so a site can observe before enforcing.
-   * Note: the Modbus/S7 conduits authorize by **source IP** — a compensating control for unauthenticated legacy protocols, not a cryptographic identity. OPC UA is the mutually-authenticated path.
+   * Authorization is by **principal**: a source IP on the plain listeners (a compensating control for legacy stations) or, on the mutual-TLS listeners (Modbus/TCP Security on 802, S7 on 10202), the **Common Name of a client certificate** issued by the lab CA. Engineering tools that cannot speak TLS reach the S7 gateway through [ews_tls_tunnel.py](ews_tls_tunnel.py). The controller side stays plain: the conduit terminates the identity.
 3. **Unified OT SOC Threat Dashboard:**
    * Console-based SIEM dashboard ([soc_dashboard.py](soc_dashboard.py)) streaming structured **Elastic Common Schema (ECS)** logs enriched with MITRE ATT&CK for ICS tags (`T0855`, `T0836`, `T0805`).
    * `--siem-udp HOST:PORT` on either gateway also forwards every event as a JSON datagram to an Elastic, Logstash or Wazuh collector, so no shared log volume is needed.
@@ -135,7 +135,9 @@ PlcSentinel/
 ├── read_via_proxy.py                    # Telemetry reader via Modbus DPI proxy
 ├── test_dpi_firewall.py                 # Automated Modbus mitigation test suite
 ├── test_dpi_policy.py                   # Offline unit tests for both DPI policy engines (no services needed)
+├── test_dpi_identity.py                 # Mutual-TLS identity tests (mints a throwaway PKI per run)
 ├── test_ews_authorized.py               # Authorized-EWS write path test, run inside the ews container
+├── test_identity_live.py                # Certificate-identity path test from the host (TLS listeners)
 ├── ot_attack_suite.py                   # MITRE ATT&CK for ICS exploit simulation
 ├── hmi_monitor.py                       # Terminal-based supervisory HMI console
 ├── inspect_pcap.py                      # Forensic Modbus TCP frame dissector
@@ -146,6 +148,9 @@ PlcSentinel/
 ├── s7_policy.json                       # S7 gateway policy: authorized EWS, open jobs and UserData
 ├── test_s7_dpi_mitigation.py            # S7 DPI mitigation test suite
 ├── generate_opcua_certs.py              # X.509 RSA PKI certificate generator
+├── generate_gateway_certs.py            # Lab CA, gateway and EWS certificates for the mutual-TLS conduits
+├── dpi_tls.py                           # Mutual-TLS helpers shared by the gateways and the EWS tunnel
+├── ews_tls_tunnel.py                    # EWS-side tunnel: local plain port -> mutual TLS -> gateway
 ├── opcua_secure_server.py               # IEC 62541 Secure OPC UA server
 ├── opcua_secure_client.py               # Mutual X.509 authenticated OPC UA client
 ├── opcua_vs_modbus.py                   # Protocol security comparison matrix
