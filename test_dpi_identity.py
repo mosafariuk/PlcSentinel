@@ -20,6 +20,7 @@ from generate_gateway_certs import make_gateway_pki
 from modbus_dpi_proxy import ModbusDPIProxy, EXC_ILLEGAL_FUNCTION
 from s7_dpi_proxy import S7DPIProxy
 from ews_tls_tunnel import Tunnel
+from tls_conduit import TlsConduit
 
 ATTACKER_IP = "127.0.0.1"   # the test client's address is deliberately NOT an authorized IP
 
@@ -177,9 +178,11 @@ class ModbusTlsIdentityTests(unittest.TestCase):
 class S7TlsIdentityTests(unittest.TestCase):
     """S7comm has no native TLS: the gateway's TLS listener authorizes the certificate CN."""
 
-    # Job: Write Var, one S7ANY item addressing DB1, framed in S7 header + COTP DT + TPKT.
-    _PARAM = b"\x05\x01" + b"\x12\x0a\x10\x02\x00\x01\x00\x01\x84\x00\x00\x00"
-    _BODY = b"\x02\xf0\x80" + b"\x32\x01\x00\x00\x00\x01" + len(_PARAM).to_bytes(2, "big") + b"\x00\x00" + _PARAM
+    # Job: Write Var, one S7ANY item addressing DB1.DBW0 with a 2-byte data section (value 840).
+    _PARAM = b"\x05\x01" + b"\x12\x0a\x10\x02\x00\x02\x00\x01\x84\x00\x00\x00"
+    _DATA = b"\x00\x04\x00\x10\x03\x48"
+    _BODY = (b"\x02\xf0\x80" + b"\x32\x01\x00\x00\x00\x01" + len(_PARAM).to_bytes(2, "big")
+             + len(_DATA).to_bytes(2, "big") + _PARAM + _DATA)
     WRITE_DB1 = b"\x03\x00" + (len(_BODY) + 4).to_bytes(2, "big") + _BODY
 
     @classmethod
@@ -257,6 +260,63 @@ class TunnelTests(unittest.TestCase):
         finally:
             plc.close()
             tmp.cleanup()
+
+
+class TlsConduitTests(unittest.TestCase):
+    """Identity gating for protocols the gateways do not parse."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.pki = make_gateway_pki(cls.tmp.name, ews_cn="ews-01", sans=("127.0.0.1",))
+        cls.client_ctx = dpi_tls.client_context(cls.pki["ews"], cls.pki["ews_key"], cls.pki["gateway_ca"])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def conduit(self, allowed, backend_port):
+        c = TlsConduit(("127.0.0.1", 0), ("127.0.0.1", backend_port), allowed, self.pki["gateway"], self.pki["gateway_key"],
+                       self.pki["gateway_ca"], log_file=os.path.join(self.tmp.name, "conduit.jsonl"))
+        listener = c.listener(0)
+        threading.Thread(target=c.accept_loop, args=(listener,), daemon=True).start()
+        return c, listener.getsockname()[1]
+
+    def exchange(self, port, payload):
+        """Send payload over mutual TLS; a refused session reads back as b'' (plain EOF or abrupt TLS close)."""
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
+            with self.client_ctx.wrap_socket(raw, server_hostname="127.0.0.1") as tls:
+                try:
+                    tls.sendall(payload)
+                    return tls.recv(1024)
+                except (ssl.SSLError, OSError):
+                    return b""
+
+    def test_listed_cn_is_relayed_byte_for_byte(self):
+        plc = FakeController()
+        try:
+            _, port = self.conduit(["ews-01"], plc.port)
+            payload = b"\x70\x00\x04\x00" + b"\x00" * 20          # an EtherNet/IP-looking blob; content is irrelevant
+            self.assertEqual(self.exchange(port, payload), payload)
+            plc.thread.join(3)
+            self.assertEqual(plc.received, payload)
+        finally:
+            plc.close()
+        with open(os.path.join(self.tmp.name, "conduit.jsonl"), encoding="utf-8") as f:
+            event = json.loads(f.readlines()[-1])
+        self.assertEqual((event["event"]["dataset"], event["event"]["action"], event["user"]["name"]), ("ics.conduit", "allowed", "ews-01"))
+
+    def test_unlisted_cn_is_refused_before_any_backend_contact(self):
+        plc = FakeController()
+        try:
+            _, port = self.conduit(["someone-else"], plc.port)
+            self.assertEqual(self.exchange(port, b"hello"), b"")
+            self.assertEqual(plc.received, b"")
+        finally:
+            plc.close()
+        with open(os.path.join(self.tmp.name, "conduit.jsonl"), encoding="utf-8") as f:
+            event = json.loads(f.readlines()[-1])
+        self.assertEqual((event["event"]["action"], event["rule"]["mitre"]["id"]), ("blocked", "T0855"))
 
 
 if __name__ == "__main__":

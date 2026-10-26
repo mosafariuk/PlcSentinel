@@ -15,6 +15,7 @@ import os
 import json
 import socket
 import threading
+from datetime import datetime, timedelta, timezone
 import tempfile
 import unittest
 
@@ -42,6 +43,17 @@ def s7_userdata(param: bytes) -> bytes:
     """Wrap an S7comm UserData parameter block in S7 header + COTP DT + TPKT."""
     s7hdr = bytes([0x32, 0x07, 0, 0, 0, 1]) + len(param).to_bytes(2, "big") + b"\x00\x00"
     body = b"\x02\xf0\x80" + s7hdr + param
+    return b"\x03\x00" + (len(body) + 4).to_bytes(2, "big") + body
+
+
+def s7_write(db: int, offset: int, data: bytes, area: int = 0x84) -> bytes:
+    """Write Var job for one byte-addressed S7ANY item, with its data section."""
+    item = (bytes([0x12, 0x0A, 0x10, 0x02]) + len(data).to_bytes(2, "big") + db.to_bytes(2, "big")
+            + bytes([area]) + (offset * 8).to_bytes(3, "big"))
+    param = b"\x05\x01" + item
+    payload = b"\x00\x04" + (len(data) * 8).to_bytes(2, "big") + data
+    s7hdr = bytes([0x32, 0x01, 0, 0, 0, 1]) + len(param).to_bytes(2, "big") + len(payload).to_bytes(2, "big")
+    body = b"\x02\xf0\x80" + s7hdr + param + payload
     return b"\x03\x00" + (len(body) + 4).to_bytes(2, "big") + body
 
 
@@ -278,11 +290,11 @@ class S7PolicyTests(unittest.TestCase):
 
     def test_write_any_db_default_denied_for_non_ews(self):
         for db in (1, 5, 99):
-            self.assertFalse(self.policy(s7_job(b"\x05\x01" + s7any_item(db)), ATTACKER))
-        self.assertFalse(self.policy(s7_job(b"\x05\x01" + s7any_item(0, area=0x83)), ATTACKER))  # markers
+            self.assertFalse(self.policy(s7_write(db, 0, b"\x03\x48"), ATTACKER))
+        self.assertFalse(self.policy(s7_write(0, 0, b"\x01", area=0x83), ATTACKER))  # markers
 
     def test_write_allowed_for_ews(self):
-        self.assertTrue(self.policy(s7_job(b"\x05\x01" + s7any_item(5)), EWS))
+        self.assertTrue(self.policy(s7_write(5, 0, b"\x03\x48"), EWS))
 
     def test_download_upload_control_ews_only(self):
         for fc in (0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x28):
@@ -358,12 +370,64 @@ class S7PolicyTests(unittest.TestCase):
             sink.close()
         self.assertEqual((event["event"]["dataset"], event["rule"]["mitre"]["id"]), ("ics.s7comm", "T0805"))
 
+    def test_protected_db_word_bounds_apply_to_everyone(self):
+        proxy = S7DPIProxy(authorized_ews_ips=[EWS], log_file=os.path.join(self.tmp.name, "b.jsonl"),
+                           protected_db_words=[{"db": 1, "offset": 0, "min": 0, "max": 900}, {"db": 1, "offset": 2, "min": 0, "max": 900}])
+        def pol(frame, who):
+            return proxy.evaluate_policy(S7PacketParser.dissect(frame), who, 1)[0]
+        self.assertTrue(pol(s7_write(1, 0, b"\x03\x48"), EWS))                 # 840: in range
+        self.assertFalse(pol(s7_write(1, 0, b"\x27\x0F"), EWS))                # 9999: refused even for the EWS
+        self.assertFalse(pol(s7_write(1, 0, b"\xFF\xFF"), EWS))                # -1: below min
+        self.assertFalse(pol(s7_write(1, 0, b"\x03\x48\x27\x0F"), EWS))       # second word of a block write
+        self.assertTrue(pol(s7_write(2, 0, b"\x27\x0F"), EWS))                 # DB2 is not protected
+        self.assertFalse(pol(s7_write(1, 0, b"\x03\x48"), ATTACKER))            # identity rule still applies
+        with open(os.path.join(self.tmp.name, "b.jsonl"), encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readlines()[0])["rule"]["mitre"]["id"], "T0836")
+
+    def test_truncated_write_data_section_fails_closed(self):
+        item = bytes([0x12, 0x0A, 0x10, 0x02, 0x00, 0x02, 0x00, 0x01, 0x84, 0x00, 0x00, 0x00])
+        param = b"\x05\x01" + item
+        payload = b"\x00\x04\x00\x10\x03"                                   # declares 16 bits, carries 1 byte
+        s7hdr = bytes([0x32, 0x01, 0, 0, 0, 1]) + len(param).to_bytes(2, "big") + len(payload).to_bytes(2, "big")
+        body = b"\x02\xf0\x80" + s7hdr + param + payload
+        self.assertIsNone(S7PacketParser.dissect(b"\x03\x00" + (len(body) + 4).to_bytes(2, "big") + body))
+
+    def test_change_windows_two_person_rule(self):
+        now = datetime.now(timezone.utc)
+        open_win = {"start": now - timedelta(hours=1), "end": now + timedelta(hours=1), "principal": EWS, "approved_by": "cn:ot-lead"}
+        download = s7_job(b"\x1a")
+        read = s7_job(b"\x04\x01" + s7any_item(1))
+        def proxy(windows):
+            return S7DPIProxy(authorized_ews_ips=[EWS], change_windows=windows, log_file=os.path.join(self.tmp.name, "w.jsonl"))
+        self.assertTrue(proxy(None).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])      # no windows declared: logged only
+        self.assertFalse(proxy([]).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])      # declared but none open
+        self.assertTrue(proxy([open_win]).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])
+        self.assertFalse(proxy([dict(open_win, principal="cn:someone-else")]).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])
+        self.assertFalse(proxy([dict(open_win, end=now - timedelta(minutes=1))]).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])
+        self.assertTrue(proxy([]).evaluate_policy(S7PacketParser.dissect(read), EWS, 1)[0])            # routine reads untouched
+
+    def test_change_window_validation(self):
+        good = {"start": "2026-10-27T08:00:00+03:00", "end": "2026-10-27T12:00:00+03:00", "principal": "cn:ews-01", "approved_by": "cn:ot-lead"}
+        for bad in (dict(good, approved_by="cn:ews-01"), dict(good, start="2026-10-27T08:00:00"), dict(good, end=good["start"]), {"start": good["start"]}, "nope"):
+            path = os.path.join(self.tmp.name, "w.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"change_windows": [bad]}, f)
+            with self.assertRaises(SystemExit, msg=repr(bad)):
+                s7_dpi_proxy.load_policy(path)
+        path = os.path.join(self.tmp.name, "w.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"change_windows": [good]}, f)
+        win = s7_dpi_proxy.load_policy(path)["change_windows"][0]
+        self.assertEqual((win["principal"], win["approved_by"], win["end"].hour), ("cn:ews-01", "cn:ot-lead", 12))
+
     def test_shipped_policy_file_matches_defaults(self):
         pol = s7_dpi_proxy.load_policy("s7_policy.json")
         self.assertEqual(frozenset(pol["open_functions"]), s7_dpi_proxy.OPEN_FCS)
         self.assertEqual(frozenset(pol["open_userdata"]), s7_dpi_proxy.OPEN_USERDATA)
         self.assertEqual(pol["authorized_ews_ips"], ["192.168.1.50"])
         self.assertEqual(pol["authorized_ews_identities"], ["ews-01"])
+        self.assertEqual(pol["change_windows"], [])          # declared: logic transfers need an approved window
+        self.assertEqual(pol["protected_db_words"], [{"db": 1, "offset": 0, "min": 0, "max": 900}])
         with self.assertRaises(SystemExit):
             s7_dpi_proxy.load_policy(self.tmp.name)  # a directory, not a file
 
