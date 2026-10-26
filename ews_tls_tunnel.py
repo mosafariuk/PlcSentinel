@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [EWS
 logger = logging.getLogger("EWSTunnel")
 
 
-def _relay(a: socket.socket, b: socket.socket) -> None:
+def relay(a: socket.socket, b: socket.socket) -> None:
     """Pump bytes between two sockets until either side closes."""
     pairs = {a: b, b: a}
     try:
@@ -67,7 +67,7 @@ class Tunnel:
             conn.close()
             return
         logger.info(f"[+] {addr[0]}:{addr[1]} -> TLS -> {self.gateway[0]}:{self.gateway[1]}")
-        _relay(conn, tls)
+        relay(conn, tls)
 
     def serve_forever(self) -> None:
         while True:
