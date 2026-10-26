@@ -22,7 +22,7 @@ import logging
 import argparse
 from typing import Any, Dict, List, Optional, Tuple
 
-from dpi_stream import (StreamDPIProxy, COMMON_POLICY_KEYS, load_policy_file,
+from plcsentinel.core.dpi_stream import (StreamDPIProxy, COMMON_POLICY_KEYS, load_policy_file,
                         add_common_arguments, common_kwargs)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [IEC104-DPI] %(message)s",

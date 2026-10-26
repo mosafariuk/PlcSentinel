@@ -20,7 +20,7 @@ import argparse
 import threading
 from typing import Tuple
 
-from dpi_tls import client_context
+from plcsentinel.core.dpi_tls import client_context
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [EWS-TUNNEL] %(message)s")
 logger = logging.getLogger("EWSTunnel")

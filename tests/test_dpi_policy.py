@@ -19,10 +19,10 @@ from datetime import datetime, timedelta, timezone
 import tempfile
 import unittest
 
-import modbus_dpi_proxy
-import s7_dpi_proxy
-from modbus_dpi_proxy import ModbusDPIProxy, EXC_ILLEGAL_FUNCTION, EXC_ILLEGAL_DATA_VALUE
-from s7_dpi_proxy import S7DPIProxy, S7PacketParser
+from plcsentinel.gateways import modbus_dpi_proxy
+from plcsentinel.gateways import s7_dpi_proxy
+from plcsentinel.gateways.modbus_dpi_proxy import ModbusDPIProxy, EXC_ILLEGAL_FUNCTION, EXC_ILLEGAL_DATA_VALUE
+from plcsentinel.gateways.s7_dpi_proxy import S7DPIProxy, S7PacketParser
 
 EWS = "192.168.1.50"
 ATTACKER = "10.0.0.9"
@@ -256,7 +256,7 @@ class ModbusPolicyTests(unittest.TestCase):
         self.assertEqual((proxy.stats["inspected"], proxy.stats["allowed"]), (400, 400))
 
     def test_shipped_policy_file_matches_defaults(self):
-        pol = modbus_dpi_proxy.load_policy("modbus_policy.json")
+        pol = modbus_dpi_proxy.load_policy("config/modbus_policy.json")
         self.assertEqual(frozenset(pol["read_function_codes"]), modbus_dpi_proxy.READ_FCS)
         self.assertEqual(pol["protected_registers"], modbus_dpi_proxy.PROTECTED_SETPOINT_REGS)
         self.assertEqual(pol["authorized_ews_ips"], ["192.168.1.50"])
@@ -421,7 +421,7 @@ class S7PolicyTests(unittest.TestCase):
         self.assertEqual((win["principal"], win["approved_by"], win["end"].hour), ("cn:ews-01", "cn:ot-lead", 12))
 
     def test_shipped_policy_file_matches_defaults(self):
-        pol = s7_dpi_proxy.load_policy("s7_policy.json")
+        pol = s7_dpi_proxy.load_policy("config/s7_policy.json")
         self.assertEqual(frozenset(pol["open_functions"]), s7_dpi_proxy.OPEN_FCS)
         self.assertEqual(frozenset(pol["open_userdata"]), s7_dpi_proxy.OPEN_USERDATA)
         self.assertEqual(pol["authorized_ews_ips"], ["192.168.1.50"])

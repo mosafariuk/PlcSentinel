@@ -9,7 +9,7 @@ import time
 import re
 import requests
 
-def init_openplc(base_url="http://127.0.0.1:8081", st_path="tank_control.st", timeout=45):
+def init_openplc(base_url="http://127.0.0.1:8081", st_path="plc/tank_control.st", timeout=45):
     s = requests.Session()
     
     # 1. Wait for OpenPLC web server to be reachable

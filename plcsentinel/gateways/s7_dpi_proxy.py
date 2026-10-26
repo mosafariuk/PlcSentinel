@@ -21,7 +21,7 @@ import argparse
 from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any
 
-from dpi_stream import StreamDPIProxy, COMMON_POLICY_KEYS, load_policy_file, add_common_arguments, common_kwargs
+from plcsentinel.core.dpi_stream import StreamDPIProxy, COMMON_POLICY_KEYS, load_policy_file, add_common_arguments, common_kwargs
 
 logging.basicConfig(
     level=logging.INFO,

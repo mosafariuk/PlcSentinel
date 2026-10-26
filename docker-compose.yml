@@ -48,7 +48,7 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
-    command: python3 s7_mock_server.py --bind 0.0.0.0 --port 1102
+    command: python3 -m plcsentinel.servers.s7_mock_server --bind 0.0.0.0 --port 1102
     # S7comm (1102) is intentionally NOT published to the host: the controller is
     # reachable only from the S7 DPI gateway over the internal control net.
     networks:
@@ -65,7 +65,7 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
-    command: python3 iec104_mock_server.py --bind 0.0.0.0 --port 24040
+    command: python3 -m plcsentinel.servers.iec104_mock_server --bind 0.0.0.0 --port 24040
     # IEC 104 (24040) is not published to the host: reachable only from the gateway.
     networks:
       ot-control-net:
@@ -82,8 +82,8 @@ services:
       retries: 3
     restart: unless-stopped
     command: >
-      sh -c "python3 generate_opcua_certs.py &&
-             python3 opcua_secure_server.py"
+      sh -c "python3 -m plcsentinel.ops.generate_opcua_certs &&
+             python3 -m plcsentinel.servers.opcua_secure_server"
     ports:
       - "4840:4840"  # Encrypted OPC UA Server (IEC 62541)
     volumes:
@@ -102,7 +102,7 @@ services:
     container_name: plcsentinel-gateway-pki
     <<: *hardened
     restart: "no"
-    command: python3 generate_gateway_certs.py --if-missing
+    command: python3 -m plcsentinel.ops.generate_gateway_certs --if-missing
     volumes:
       - ./certs:/app/certs
     networks:
@@ -123,12 +123,12 @@ services:
       retries: 3
     restart: unless-stopped
     command: >
-      python3 modbus_dpi_proxy.py
+      python3 -m plcsentinel.gateways.modbus_dpi_proxy
       --listen-host 0.0.0.0
       --listen-port 5020
       --backend-host 10.0.1.10
       --backend-port 502
-      --policy modbus_policy.json
+      --policy config/modbus_policy.json
       --tls-port 802
       --log-file /app/logs/ot_security_events.jsonl
     ports:
@@ -159,12 +159,12 @@ services:
       retries: 3
     restart: unless-stopped
     command: >
-      python3 s7_dpi_proxy.py
+      python3 -m plcsentinel.gateways.s7_dpi_proxy
       --listen-host 0.0.0.0
       --listen-port 10200
       --backend-host 10.0.1.20
       --backend-port 1102
-      --policy s7_policy.json
+      --policy config/s7_policy.json
       --tls-port 10202
       --log-file /app/logs/s7_security_events.jsonl
     ports:
@@ -219,12 +219,12 @@ services:
       retries: 3
     restart: unless-stopped
     command: >
-      python3 iec104_dpi_proxy.py
+      python3 -m plcsentinel.gateways.iec104_dpi_proxy
       --listen-host 0.0.0.0
       --listen-port 2404
       --backend-host 10.0.1.30
       --backend-port 24040
-      --policy iec104_policy.json
+      --policy config/iec104_policy.json
       --tls-port 24040
       --log-file /app/logs/iec104_security_events.jsonl
     ports:
@@ -248,7 +248,7 @@ services:
     container_name: plcsentinel-soc-dashboard
     <<: *hardened
     restart: unless-stopped
-    command: python3 soc_dashboard.py --watch --interval 5
+    command: python3 -m plcsentinel.ops.soc_dashboard --watch --interval 5
     volumes:
       - ./logs:/app/logs:ro
     depends_on:

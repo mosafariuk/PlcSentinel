@@ -18,9 +18,9 @@ import sys
 import logging
 from pymodbus.client import ModbusTcpClient, ModbusTlsClient
 
-import dpi_tls
-from ews_tls_tunnel import Tunnel
-from s7_sentinel import S7Sentinel
+from plcsentinel.core import dpi_tls
+from plcsentinel.clients.ews_tls_tunnel import Tunnel
+from plcsentinel.clients.s7_sentinel import S7Sentinel
 
 # force: s7_sentinel configures logging on import, which would otherwise win.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [IDENTITY-TESTER] %(message)s", force=True)

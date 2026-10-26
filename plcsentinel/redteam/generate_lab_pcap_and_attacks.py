@@ -109,7 +109,7 @@ class ModbusSessionRecorder:
         self.transceive(mb.ModbusPDU06WriteSingleRegisterRequest(registerAddr=0, registerValue=850), label="FC06 Restore Safe High Setpoint")
         self.transceive(mb.ModbusPDU06WriteSingleRegisterRequest(registerAddr=1, registerValue=200), label="FC06 Restore Safe Low Setpoint")
 
-    def save_pcap(self, filename="modbus_lab_traffic.pcap"):
+    def save_pcap(self, filename="data/modbus_lab_traffic.pcap"):
         logger.info(f"Saving {len(self.captured_packets)} captured packets to '{filename}'...")
         wrpcap(filename, self.captured_packets)
         logger.info(f"PCAP saved successfully: {filename}")
@@ -125,4 +125,4 @@ if __name__ == "__main__":
         recorder.run_day5_ot_anomalies_and_attacks()
     finally:
         recorder.close()
-        recorder.save_pcap("modbus_lab_traffic.pcap")
+        recorder.save_pcap("data/modbus_lab_traffic.pcap")

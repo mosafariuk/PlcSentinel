@@ -23,8 +23,8 @@ import argparse
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from dpi_limits import SourceLimiter
-from dpi_tls import server_context, peer_principal
+from plcsentinel.core.dpi_limits import SourceLimiter
+from plcsentinel.core.dpi_tls import server_context, peer_principal
 
 logger = logging.getLogger("StreamDPI")
 
