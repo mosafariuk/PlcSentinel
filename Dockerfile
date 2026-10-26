@@ -14,6 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . /app
 
+# Every service runs unprivileged; all listening ports are above 1024.
+RUN useradd --system --uid 10001 --create-home plcsentinel
+USER plcsentinel
+
 EXPOSE 5020 10200 4840 1102
 
 CMD ["python3", "soc_dashboard.py"]
