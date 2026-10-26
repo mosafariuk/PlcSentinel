@@ -14,6 +14,7 @@ semantic setpoint boundary and the bulk-write (FC16) scan.
 import os
 import json
 import socket
+import threading
 import tempfile
 import unittest
 
@@ -212,6 +213,36 @@ class ModbusPolicyTests(unittest.TestCase):
         proxy.limiter.close_session(ATTACKER)
         self.assertTrue(proxy.limiter.open_session(ATTACKER))
 
+    def test_siem_udp_forwarding(self):
+        sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sink.bind(("127.0.0.1", 0))
+        sink.settimeout(1)
+        try:
+            proxy = ModbusDPIProxy(authorized_ews_ips=[EWS], log_file=os.path.join(self.tmp.name, "u.jsonl"),
+                                   siem_udp=("127.0.0.1", sink.getsockname()[1]))
+            proxy.inspect_request(adu("0001 0000 0006 01 06 0000 270F"), ATTACKER, 1)
+            event = json.loads(sink.recv(65535))
+        finally:
+            sink.close()
+        self.assertEqual((event["event"]["dataset"], event["event"]["action"]), ("ics.modbus", "blocked"))
+
+    def test_concurrent_sessions_keep_log_lines_and_counters_intact(self):
+        log = os.path.join(self.tmp.name, "threads.jsonl")
+        proxy = ModbusDPIProxy(authorized_ews_ips=[EWS], log_file=log, max_requests_per_second=10**6)
+        read = adu("0001 0000 0006 01 03 0000 0002")
+        def worker():
+            for _ in range(50):
+                proxy.inspect_request(read, ATTACKER, 1)
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        with open(log, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 400)
+        for line in lines:
+            json.loads(line)                                  # every line is one intact event
+        self.assertEqual((proxy.stats["inspected"], proxy.stats["allowed"]), (400, 400))
+
     def test_shipped_policy_file_matches_defaults(self):
         pol = modbus_dpi_proxy.load_policy("modbus_policy.json")
         self.assertEqual(frozenset(pol["read_function_codes"]), modbus_dpi_proxy.READ_FCS)
@@ -312,6 +343,19 @@ class S7PolicyTests(unittest.TestCase):
         self.assertEqual([proxy.limiter.open_session(ATTACKER) for _ in range(3)], [True, True, False])
         proxy.limiter.close_session(ATTACKER)
         self.assertTrue(proxy.limiter.open_session(ATTACKER))
+
+    def test_siem_udp_forwarding(self):
+        sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sink.bind(("127.0.0.1", 0))
+        sink.settimeout(1)
+        try:
+            proxy = S7DPIProxy(authorized_ews_ips=[EWS], log_file=os.path.join(self.tmp.name, "u.jsonl"),
+                               siem_udp=("127.0.0.1", sink.getsockname()[1]))
+            proxy.evaluate_policy(S7PacketParser.dissect(s7_job(b"\x29\x00\x00\x00\x00")), ATTACKER, 1)
+            event = json.loads(sink.recv(65535))
+        finally:
+            sink.close()
+        self.assertEqual((event["event"]["dataset"], event["rule"]["mitre"]["id"]), ("ics.s7comm", "T0805"))
 
     def test_shipped_policy_file_matches_defaults(self):
         pol = s7_dpi_proxy.load_policy("s7_policy.json")

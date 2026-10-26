@@ -18,6 +18,7 @@ Architectural Role:
 import os
 import sys
 import json
+import socket
 import asyncio
 import logging
 import argparse
@@ -239,7 +240,8 @@ class S7DPIProxy:
         log_file: str = "logs/s7_security_events.jsonl",
         enforce: bool = True,
         max_sessions_per_source: int = 8,
-        max_requests_per_second: int = 200
+        max_requests_per_second: int = 200,
+        siem_udp: Optional[Tuple[str, int]] = None
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -252,6 +254,8 @@ class S7DPIProxy:
         # Monitor mode: violations are inspected and logged but forwarded.
         self.enforce = enforce
         self.limiter = SourceLimiter(max_sessions_per_source, max_requests_per_second)
+        self._siem_udp = siem_udp
+        self._siem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if siem_udp else None
 
         self.stats = {"sessions": 0, "packets": 0, "allowed": 0, "blocked": 0}
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -291,8 +295,14 @@ class S7DPIProxy:
                 }
             }
         }
+        line = json.dumps(event) + "\n"
         with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
+            f.write(line)
+        if self._siem_sock:
+            try:
+                self._siem_sock.sendto(line.encode("utf-8"), self._siem_udp)
+            except OSError as e:
+                logger.warning(f"SIEM UDP forward to {self._siem_udp} failed: {e}")
 
     def _deny_action(self) -> str:
         return "blocked" if self.enforce else "detected"
@@ -559,9 +569,14 @@ if __name__ == "__main__":
     parser.add_argument("--authorized-ews", action="append", default=None, help="Authorized EWS IP; repeatable (default: 192.168.1.50)")
     parser.add_argument("--log-file", type=str, default="logs/s7_security_events.jsonl", help="SIEM event output path")
     parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
+    parser.add_argument("--siem-udp", type=str, metavar="HOST:PORT", help="Also send every event as a JSON datagram to this collector (Elastic/Logstash/Wazuh)")
     args = parser.parse_args()
 
     policy = load_policy(args.policy) if args.policy else {}
+    siem_udp = None
+    if args.siem_udp:
+        host, _, port = args.siem_udp.rpartition(":")
+        siem_udp = (host, int(port))
     proxy = S7DPIProxy(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
@@ -573,7 +588,8 @@ if __name__ == "__main__":
         log_file=args.log_file,
         enforce=policy.get("enforce", True) and not args.monitor,
         max_sessions_per_source=policy.get("max_sessions_per_source", 8),
-        max_requests_per_second=policy.get("max_requests_per_second", 200)
+        max_requests_per_second=policy.get("max_requests_per_second", 200),
+        siem_udp=siem_udp
     )
     try:
         asyncio.run(proxy.start())
