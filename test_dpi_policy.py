@@ -15,6 +15,7 @@ import os
 import json
 import socket
 import threading
+from datetime import datetime, timedelta, timezone
 import tempfile
 import unittest
 
@@ -358,12 +359,41 @@ class S7PolicyTests(unittest.TestCase):
             sink.close()
         self.assertEqual((event["event"]["dataset"], event["rule"]["mitre"]["id"]), ("ics.s7comm", "T0805"))
 
+    def test_change_windows_two_person_rule(self):
+        now = datetime.now(timezone.utc)
+        open_win = {"start": now - timedelta(hours=1), "end": now + timedelta(hours=1), "principal": EWS, "approved_by": "cn:ot-lead"}
+        download = s7_job(b"\x1a")
+        read = s7_job(b"\x04\x01" + s7any_item(1))
+        def proxy(windows):
+            return S7DPIProxy(authorized_ews_ips=[EWS], change_windows=windows, log_file=os.path.join(self.tmp.name, "w.jsonl"))
+        self.assertTrue(proxy(None).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])      # no windows declared: logged only
+        self.assertFalse(proxy([]).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])      # declared but none open
+        self.assertTrue(proxy([open_win]).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])
+        self.assertFalse(proxy([dict(open_win, principal="cn:someone-else")]).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])
+        self.assertFalse(proxy([dict(open_win, end=now - timedelta(minutes=1))]).evaluate_policy(S7PacketParser.dissect(download), EWS, 1)[0])
+        self.assertTrue(proxy([]).evaluate_policy(S7PacketParser.dissect(read), EWS, 1)[0])            # routine reads untouched
+
+    def test_change_window_validation(self):
+        good = {"start": "2026-10-27T08:00:00+03:00", "end": "2026-10-27T12:00:00+03:00", "principal": "cn:ews-01", "approved_by": "cn:ot-lead"}
+        for bad in (dict(good, approved_by="cn:ews-01"), dict(good, start="2026-10-27T08:00:00"), dict(good, end=good["start"]), {"start": good["start"]}, "nope"):
+            path = os.path.join(self.tmp.name, "w.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"change_windows": [bad]}, f)
+            with self.assertRaises(SystemExit, msg=repr(bad)):
+                s7_dpi_proxy.load_policy(path)
+        path = os.path.join(self.tmp.name, "w.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"change_windows": [good]}, f)
+        win = s7_dpi_proxy.load_policy(path)["change_windows"][0]
+        self.assertEqual((win["principal"], win["approved_by"], win["end"].hour), ("cn:ews-01", "cn:ot-lead", 12))
+
     def test_shipped_policy_file_matches_defaults(self):
         pol = s7_dpi_proxy.load_policy("s7_policy.json")
         self.assertEqual(frozenset(pol["open_functions"]), s7_dpi_proxy.OPEN_FCS)
         self.assertEqual(frozenset(pol["open_userdata"]), s7_dpi_proxy.OPEN_USERDATA)
         self.assertEqual(pol["authorized_ews_ips"], ["192.168.1.50"])
         self.assertEqual(pol["authorized_ews_identities"], ["ews-01"])
+        self.assertEqual(pol["change_windows"], [])          # declared: logic transfers need an approved window
         with self.assertRaises(SystemExit):
             s7_dpi_proxy.load_policy(self.tmp.name)  # a directory, not a file
 
