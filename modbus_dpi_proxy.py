@@ -19,6 +19,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any
 
+from dpi_limits import SourceLimiter
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [DPI-GATEWAY] %(message)s",
@@ -58,6 +60,8 @@ POLICY_KEYS = {
     "authorized_ews_ips": list,
     "read_function_codes": list,
     "protected_registers": dict,
+    "max_sessions_per_source": int,
+    "max_requests_per_second": int,
     "enforce": bool,
 }
 
@@ -73,7 +77,7 @@ def load_policy(path: str) -> Dict[str, Any]:
     if not isinstance(policy, dict) or set(policy) - set(POLICY_KEYS):
         raise SystemExit(f"[FATAL] Policy file {path}: expected an object with keys {sorted(POLICY_KEYS)}")
     for key, typ in POLICY_KEYS.items():
-        if key in policy and not isinstance(policy[key], typ):
+        if key in policy and (not isinstance(policy[key], typ) or (typ is int and isinstance(policy[key], bool))):
             raise SystemExit(f"[FATAL] Policy file {path}: {key!r} must be a JSON {typ.__name__}")
     try:
         if "protected_registers" in policy:
@@ -95,7 +99,9 @@ class ModbusDPIProxy:
         read_fcs=READ_FCS,
         protected_registers: Optional[Dict[int, int]] = None,
         log_file: str = "logs/ot_security_events.jsonl",
-        enforce: bool = True
+        enforce: bool = True,
+        max_sessions_per_source: int = 8,
+        max_requests_per_second: int = 200
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -108,6 +114,7 @@ class ModbusDPIProxy:
         # Monitor mode: every violation is still inspected and logged, but the
         # frame is forwarded, so a site can observe inline before enforcing.
         self.enforce = enforce
+        self.limiter = SourceLimiter(max_sessions_per_source, max_requests_per_second)
         self.stats = {"inspected": 0, "allowed": 0, "blocked": 0}
 
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -162,6 +169,15 @@ class ModbusDPIProxy:
 
     def _deny_action(self) -> str:
         return "blocked" if self.enforce else "detected"
+
+    def _emit_limit_event(self, client_ip: str, client_port: int, reason: str):
+        """Resource caps protect the gateway and controller, so they apply in both modes."""
+        logger.warning(f"[BLOCKED] {reason}")
+        self.emit_siem_event(
+            action="blocked", severity="high", reason=reason, client_ip=client_ip, client_port=client_port,
+            trans_id=0, unit_id=0, fc=0, mitre_technique_id="T0814", mitre_technique_name="Denial of Service",
+            payload_details={"max_sessions": self.limiter.max_sessions, "max_requests_per_second": self.limiter.max_rps}
+        )
 
     def generate_exception_response(self, trans_id: int, unit_id: int, orig_fc: int, exc_code: int) -> bytes:
         mbap = trans_id.to_bytes(2, "big") + b"\x00\x00" + b"\x00\x03" + unit_id.to_bytes(1, "big")
@@ -304,6 +320,18 @@ class ModbusDPIProxy:
 
     def handle_client_session(self, client_sock: socket.socket, client_addr: Tuple[str, int]):
         client_ip, client_port = client_addr
+        if not self.limiter.open_session(client_ip):
+            self._emit_limit_event(client_ip, client_port,
+                                   f"Session cap: {self.limiter.max_sessions} sessions already open from {client_ip}; refusing another")
+            client_sock.close()
+            return
+        try:
+            self._serve_session(client_sock, client_addr)
+        finally:
+            self.limiter.close_session(client_ip)
+
+    def _serve_session(self, client_sock: socket.socket, client_addr: Tuple[str, int]):
+        client_ip, client_port = client_addr
         try:
             backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             backend_sock.settimeout(3.0)
@@ -370,6 +398,10 @@ class ModbusDPIProxy:
             if len(buf) < total:
                 break  # wait for the remainder of this ADU
             adu, buf = buf[:total], buf[total:]
+            if not self.limiter.allow_request(client_ip):
+                self._emit_limit_event(client_ip, client_port,
+                                       f"Request rate cap: over {self.limiter.max_rps} requests/s from {client_ip}; dropping session")
+                return None
             is_allowed, synthetic_resp, reason = self.inspect_request(adu, client_ip, client_port)
             if is_allowed:
                 backend_sock.sendall(adu)
@@ -429,6 +461,8 @@ if __name__ == "__main__":
         read_fcs=policy.get("read_function_codes", READ_FCS),
         protected_registers=policy.get("protected_registers"),
         log_file=args.log_file,
-        enforce=policy.get("enforce", True) and not args.monitor
+        enforce=policy.get("enforce", True) and not args.monitor,
+        max_sessions_per_source=policy.get("max_sessions_per_source", 8),
+        max_requests_per_second=policy.get("max_requests_per_second", 200)
     )
     proxy.start_proxy()
