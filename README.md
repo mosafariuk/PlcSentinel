@@ -129,6 +129,7 @@ PlcSentinel/
 ├── read_via_proxy.py                    # Telemetry reader via Modbus DPI proxy
 ├── test_dpi_firewall.py                 # Automated Modbus mitigation test suite
 ├── test_dpi_policy.py                   # Offline unit tests for both DPI policy engines (no services needed)
+├── test_ews_authorized.py               # Authorized-EWS write path test, run inside the ews container
 ├── ot_attack_suite.py                   # MITRE ATT&CK for ICS exploit simulation
 ├── hmi_monitor.py                       # Terminal-based supervisory HMI console
 ├── inspect_pcap.py                      # Forensic Modbus TCP frame dissector
