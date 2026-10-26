@@ -20,8 +20,8 @@ import ssl
 from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any
 
-from dpi_limits import SourceLimiter
-from dpi_tls import server_context, peer_principal
+from plcsentinel.core.dpi_limits import SourceLimiter
+from plcsentinel.core.dpi_tls import server_context, peer_principal
 
 logging.basicConfig(
     level=logging.INFO,

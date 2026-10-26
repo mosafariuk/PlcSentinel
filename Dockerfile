@@ -20,4 +20,4 @@ USER plcsentinel
 
 EXPOSE 5020 802 10200 10202 4840 1102
 
-CMD ["python3", "soc_dashboard.py"]
+CMD ["python3", "-m", "plcsentinel.ops.soc_dashboard"]

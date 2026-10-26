@@ -10,7 +10,7 @@ Applies IEC 62443 / MITRE ATT&CK for ICS detection logic against PCAP traffic:
 import sys
 from scapy.all import rdpcap, TCP
 
-def run_ids_inspection(pcap_path="modbus_lab_traffic.pcap", authorized_ews_ip="192.168.1.50"):
+def run_ids_inspection(pcap_path="data/modbus_lab_traffic.pcap", authorized_ews_ip="192.168.1.50"):
     print(f"[*] Starting ICS Intrusion Detection Engine on: {pcap_path}")
     print(f"[*] Authorized Engineering Station IP: {authorized_ews_ip}")
     print("=" * 80)

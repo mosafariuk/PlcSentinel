@@ -25,9 +25,9 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
-from dpi_tls import server_context, peer_principal
-from dpi_limits import SourceLimiter
-from ews_tls_tunnel import relay
+from plcsentinel.core.dpi_tls import server_context, peer_principal
+from plcsentinel.core.dpi_limits import SourceLimiter
+from plcsentinel.clients.ews_tls_tunnel import relay
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [TLS-CONDUIT] %(message)s")
 logger = logging.getLogger("TlsConduit")

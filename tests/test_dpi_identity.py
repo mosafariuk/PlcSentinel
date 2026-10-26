@@ -15,12 +15,12 @@ import tempfile
 import threading
 import unittest
 
-import dpi_tls
-from generate_gateway_certs import make_gateway_pki
-from modbus_dpi_proxy import ModbusDPIProxy, EXC_ILLEGAL_FUNCTION
-from s7_dpi_proxy import S7DPIProxy
-from ews_tls_tunnel import Tunnel
-from tls_conduit import TlsConduit
+from plcsentinel.core import dpi_tls
+from plcsentinel.ops.generate_gateway_certs import make_gateway_pki
+from plcsentinel.gateways.modbus_dpi_proxy import ModbusDPIProxy, EXC_ILLEGAL_FUNCTION
+from plcsentinel.gateways.s7_dpi_proxy import S7DPIProxy
+from plcsentinel.clients.ews_tls_tunnel import Tunnel
+from plcsentinel.gateways.tls_conduit import TlsConduit
 
 ATTACKER_IP = "127.0.0.1"   # the test client's address is deliberately NOT an authorized IP
 

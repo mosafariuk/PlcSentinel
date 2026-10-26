@@ -17,7 +17,7 @@ import logging
 from pymodbus.client import ModbusTcpClient
 from snap7.client import Client
 from snap7.util import set_int
-from s7_sentinel import S7Sentinel
+from plcsentinel.clients.s7_sentinel import S7Sentinel
 
 MODBUS_PROXY = os.environ.get("MODBUS_PROXY", "192.168.1.100")
 S7_PROXY = os.environ.get("S7_PROXY", "192.168.1.101")
