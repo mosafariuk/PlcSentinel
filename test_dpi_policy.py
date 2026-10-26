@@ -12,6 +12,7 @@ semantic setpoint boundary and the bulk-write (FC16) scan.
 """
 
 import os
+import json
 import socket
 import tempfile
 import unittest
@@ -132,6 +133,26 @@ class ModbusPolicyTests(unittest.TestCase):
                 s.close()
 
 
+    def test_monitor_mode_forwards_and_logs_detected(self):
+        log = os.path.join(self.tmp.name, "mon.jsonl")
+        proxy = ModbusDPIProxy(authorized_ews_ip=EWS, log_file=log, enforce=False)
+        client, client_peer = socket.socketpair()
+        backend, backend_peer = socket.socketpair()
+        try:
+            write = adu("0002 0000 0006 01 06 0000 270F")
+            self.assertEqual(proxy._process_client_stream(write, client_peer, backend_peer, ATTACKER, 1), b"")
+            backend.settimeout(1)
+            self.assertEqual(backend.recv(1024), write)          # forwarded despite the violation
+            client.settimeout(0.2)
+            with self.assertRaises(socket.timeout):
+                client.recv(1024)                                # no synthetic exception sent
+        finally:
+            for s in (client, client_peer, backend, backend_peer):
+                s.close()
+        with open(log, encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["event"]["action"], "detected")
+
+
 class S7PolicyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -184,6 +205,15 @@ class S7PolicyTests(unittest.TestCase):
         truncated = s7_job(b"\x05\x01" + s7any_item(1)[:6])
         self.assertIsNone(S7PacketParser.dissect(odd_syntax))
         self.assertIsNone(S7PacketParser.dissect(truncated))
+
+    def test_monitor_mode_forwards_violations(self):
+        log = os.path.join(self.tmp.name, "mon.jsonl")
+        proxy = S7DPIProxy(authorized_ews_ip=EWS, log_file=log, enforce=False)
+        stop = s7_job(b"\x29\x00\x00\x00\x00")
+        out, rest, reason = proxy._frame_client_stream(stop, ATTACKER, 1)
+        self.assertEqual((out, rest, reason), (stop, b"", None))
+        with open(log, encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["event"]["action"], "detected")
 
     def test_cotp_connect_passes_through(self):
         cr = b"\x03\x00\x00\x16\x11\xe0\x00\x00\x00\x01\x00\xc0\x01\x0a\xc1\x02\x01\x00\xc2\x02\x01\x02"
