@@ -62,7 +62,8 @@ class ModbusDPIProxy:
         backend_port: int = 502,
         authorized_ews_ip: str = "192.168.1.50",
         max_safe_high_threshold: int = 900,
-        log_file: str = "logs/ot_security_events.jsonl"
+        log_file: str = "logs/ot_security_events.jsonl",
+        enforce: bool = True
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -71,6 +72,9 @@ class ModbusDPIProxy:
         self.authorized_ews_ip = authorized_ews_ip
         self.max_safe_high_threshold = max_safe_high_threshold
         self.log_file = log_file
+        # Monitor mode: every violation is still inspected and logged, but the
+        # frame is forwarded, so a site can observe inline before enforcing.
+        self.enforce = enforce
         self.stats = {"inspected": 0, "allowed": 0, "blocked": 0}
 
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -122,6 +126,9 @@ class ModbusDPIProxy:
 
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
+
+    def _deny_action(self) -> str:
+        return "blocked" if self.enforce else "detected"
 
     def generate_exception_response(self, trans_id: int, unit_id: int, orig_fc: int, exc_code: int) -> bytes:
         mbap = trans_id.to_bytes(2, "big") + b"\x00\x00" + b"\x00\x03" + unit_id.to_bytes(1, "big")
@@ -193,7 +200,7 @@ class ModbusDPIProxy:
             val = int.from_bytes(raw_pkt[10:12], "big") if len(raw_pkt) >= 12 else 0
 
             self.emit_siem_event(
-                action="blocked",
+                action=self._deny_action(),
                 severity="high",
                 reason=reason,
                 client_ip=client_ip,
@@ -230,7 +237,7 @@ class ModbusDPIProxy:
             exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_DATA_VALUE)
 
             self.emit_siem_event(
-                action="blocked",
+                action=self._deny_action(),
                 severity="critical",
                 reason=reason,
                 client_ip=client_ip,
@@ -332,6 +339,9 @@ class ModbusDPIProxy:
             is_allowed, synthetic_resp, reason = self.inspect_request(adu, client_ip, client_port)
             if is_allowed:
                 backend_sock.sendall(adu)
+            elif not self.enforce:
+                logger.warning(f"[MONITOR] Would block, forwarding anyway. Reason: {reason}")
+                backend_sock.sendall(adu)
             else:
                 logger.warning(f"[BLOCKED] Packet dropped! Reason: {reason}")
                 if synthetic_resp:
@@ -346,6 +356,7 @@ class ModbusDPIProxy:
         logger.info("=" * 70)
         logger.info(f"Modbus L7 DPI Proxy ACTIVE on {self.listen_host}:{self.listen_port}")
         logger.info(f"SIEM Structured Logging: {os.path.abspath(self.log_file)}")
+        logger.info(f"Mode: {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
         logger.info("=" * 70)
 
         try:
@@ -369,6 +380,7 @@ if __name__ == "__main__":
     parser.add_argument("--backend-port", type=int, default=502, help="Backend PLC port (default: 502)")
     parser.add_argument("--authorized-ip", type=str, default="192.168.1.50", help="Authorized EWS IP (default: 192.168.1.50)")
     parser.add_argument("--log-file", type=str, default="logs/ot_security_events.jsonl", help="SIEM event log path")
+    parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
     args = parser.parse_args()
 
     proxy = ModbusDPIProxy(
@@ -377,6 +389,7 @@ if __name__ == "__main__":
         backend_host=args.backend_host,
         backend_port=args.backend_port,
         authorized_ews_ip=args.authorized_ip,
-        log_file=args.log_file
+        log_file=args.log_file,
+        enforce=not args.monitor
     )
     proxy.start_proxy()

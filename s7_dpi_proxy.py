@@ -199,7 +199,8 @@ class S7DPIProxy:
         backend_host: str = "127.0.0.1",
         backend_port: int = 102,
         authorized_ews_ip: str = "192.168.1.50",
-        log_file: str = "logs/s7_security_events.jsonl"
+        log_file: str = "logs/s7_security_events.jsonl",
+        enforce: bool = True
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -207,6 +208,8 @@ class S7DPIProxy:
         self.backend_port = backend_port
         self.authorized_ews_ip = authorized_ews_ip
         self.log_file = log_file
+        # Monitor mode: violations are inspected and logged but forwarded.
+        self.enforce = enforce
 
         self.stats = {"sessions": 0, "packets": 0, "allowed": 0, "blocked": 0}
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -249,6 +252,9 @@ class S7DPIProxy:
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
+    def _deny_action(self) -> str:
+        return "blocked" if self.enforce else "detected"
+
     def evaluate_policy(self, parsed: Dict[str, Any], client_ip: str, client_port: int) -> Tuple[bool, str]:
         """
         Layer-7 Policy Evaluation for a single, fully-framed S7comm PDU.
@@ -266,7 +272,7 @@ class S7DPIProxy:
             self.stats["blocked"] += 1
             reason = f"CRITICAL ATTACK: S7comm CPU Stop command (0x29) detected from {client_ip}!"
             self.log_ecs_event(
-                action="blocked",
+                action=self._deny_action(),
                 severity="critical",
                 reason=reason,
                 client_ip=client_ip,
@@ -292,7 +298,7 @@ class S7DPIProxy:
             self.stats["blocked"] += 1
             reason = f"CRITICAL ATTACK: Unauthorized S7comm {fc_name} from non-EWS IP {client_ip}!"
             self.log_ecs_event(
-                action="blocked",
+                action=self._deny_action(),
                 severity="critical",
                 reason=reason,
                 client_ip=client_ip,
@@ -316,7 +322,7 @@ class S7DPIProxy:
                 f"(DB{item.get('db_number')}.DBB{item.get('byte_offset')}) from IP {client_ip}!"
             )
             self.log_ecs_event(
-                action="blocked",
+                action=self._deny_action(),
                 severity="high",
                 reason=reason,
                 client_ip=client_ip,
@@ -342,7 +348,7 @@ class S7DPIProxy:
             f"denied from non-EWS IP {client_ip}!"
         )
         self.log_ecs_event(
-            action="blocked",
+            action=self._deny_action(),
             severity="high",
             reason=reason,
             client_ip=client_ip,
@@ -386,8 +392,10 @@ class S7DPIProxy:
                 continue
 
             allowed, reason = self.evaluate_policy(parsed, client_ip, client_port)
-            if not allowed:
+            if not allowed and self.enforce:
                 return out, buf, reason
+            if not allowed:
+                logger.warning(f"[MONITOR] Would block, forwarding anyway. Reason: {reason}")
             out += msg
         return out, buf, None
 
@@ -467,6 +475,7 @@ class S7DPIProxy:
         logger.info(f"Forwarding sanitized traffic to Siemens PLC at {self.backend_host}:{self.backend_port}")
         logger.info(f"Authorized Engineering Station IP : {self.authorized_ews_ip}")
         logger.info(f"SIEM Structured Logging           : {os.path.abspath(self.log_file)}")
+        logger.info(f"Mode                              : {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
         logger.info("=" * 72)
 
         async with server:
@@ -481,6 +490,7 @@ if __name__ == "__main__":
     parser.add_argument("--backend-port", type=int, default=1102, help="Backend PLC port (default: 1102 or 102)")
     parser.add_argument("--authorized-ews", type=str, default="192.168.1.50", help="Authorized EWS IP (default: 192.168.1.50)")
     parser.add_argument("--log-file", type=str, default="logs/s7_security_events.jsonl", help="SIEM event output path")
+    parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
     args = parser.parse_args()
 
     proxy = S7DPIProxy(
@@ -489,7 +499,8 @@ if __name__ == "__main__":
         backend_host=args.backend_host,
         backend_port=args.backend_port,
         authorized_ews_ip=args.authorized_ews,
-        log_file=args.log_file
+        log_file=args.log_file,
+        enforce=not args.monitor
     )
     try:
         asyncio.run(proxy.start())
