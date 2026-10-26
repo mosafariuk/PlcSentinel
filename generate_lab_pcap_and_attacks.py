@@ -65,7 +65,7 @@ class ModbusSessionRecorder:
 
     def run_day3_baseline_telemetry(self):
         logger.info("=== DAY 3: BASELINE TELEMETRY POLLING ===")
-        # 1. Read Discrete Inputs (%IX0.0..%IX0.2) - FC 02
+        # 1. Read Discrete Inputs (%IX0.0..%IX0.1) - FC 02
         self.transceive(mb.ModbusPDU02ReadDiscreteInputsRequest(startAddr=0, quantity=4), label="FC02 Read Discrete Inputs")
         
         # 2. Read Coils (%QX0.0..%QX0.3) - FC 01
