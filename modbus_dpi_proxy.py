@@ -2,7 +2,7 @@
 """
 PlcSentinel - Upgraded Layer-7 Modbus Deep Packet Inspection (DPI) Proxy with SIEM Logging
 Enforces:
-1. Role-Based Access Control (ACL)
+1. Read-only allowlist for every host; all other function codes are EWS-only
 2. Semantic Process Boundary Inspection (Overfill Prevention)
 3. RFC-Compliant Exception Generation (0x01 Illegal Function, 0x03 Illegal Data Value)
 4. Structured SIEM JSON/ECS Event Streaming (logs/ot_security_events.jsonl)
@@ -40,11 +40,49 @@ FC_NAMES = {
     6: "Write Single Register",
     15: "Write Multiple Coils",
     16: "Write Multiple Registers",
+    22: "Mask Write Register",
+    23: "Read/Write Multiple Registers",
+    43: "Read Device Identification",
 }
 
-# Holding registers 0 (High) and 1 (Low) are the tank setpoints, both scaled
-# 0..1000; neither may be pushed above the safe capacity threshold.
-PROTECTED_SETPOINT_REGS = (0, 1)
+# Only plain reads are open to every host. Writes, FC22/23 masked and combined
+# writes, FC08 diagnostics and vendor codes all require the EWS identity.
+READ_FCS = frozenset({1, 2, 3, 4})
+
+# Protected holding registers -> maximum safe value. Registers 0 (High) and
+# 1 (Low) are the tank setpoints, scaled 0..1000.
+PROTECTED_SETPOINT_REGS = {0: 900, 1: 900}
+
+# JSON policy file keys and their types; CLI flags override file values.
+POLICY_KEYS = {
+    "authorized_ews_ips": list,
+    "read_function_codes": list,
+    "protected_registers": dict,
+    "enforce": bool,
+}
+
+
+def load_policy(path: str) -> Dict[str, Any]:
+    """Read and validate a JSON policy file. Any problem is fatal at startup:
+    a gateway must never run on a policy it only half understood."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            policy = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"[FATAL] Cannot read policy file {path}: {e}")
+    if not isinstance(policy, dict) or set(policy) - set(POLICY_KEYS):
+        raise SystemExit(f"[FATAL] Policy file {path}: expected an object with keys {sorted(POLICY_KEYS)}")
+    for key, typ in POLICY_KEYS.items():
+        if key in policy and not isinstance(policy[key], typ):
+            raise SystemExit(f"[FATAL] Policy file {path}: {key!r} must be a JSON {typ.__name__}")
+    try:
+        if "protected_registers" in policy:
+            policy["protected_registers"] = {int(k): int(v) for k, v in policy["protected_registers"].items()}
+        if "read_function_codes" in policy:
+            policy["read_function_codes"] = [int(v) for v in policy["read_function_codes"]]
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"[FATAL] Policy file {path}: register addresses, limits and function codes must be integers ({e})")
+    return policy
 
 class ModbusDPIProxy:
     def __init__(
@@ -53,18 +91,23 @@ class ModbusDPIProxy:
         listen_port: int = 5020,
         backend_host: str = "127.0.0.1",
         backend_port: int = 502,
-        authorized_ews_ip: str = "192.168.1.50",
-        max_safe_high_threshold: int = 900,
-        log_file: str = "logs/ot_security_events.jsonl"
+        authorized_ews_ips=("192.168.1.50",),
+        read_fcs=READ_FCS,
+        protected_registers: Optional[Dict[int, int]] = None,
+        log_file: str = "logs/ot_security_events.jsonl",
+        enforce: bool = True
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.backend_host = backend_host
         self.backend_port = backend_port
-        self.authorized_ews_ip = authorized_ews_ip
-        self.max_safe_high_threshold = max_safe_high_threshold
+        self.authorized_ews_ips = frozenset(authorized_ews_ips)
+        self.read_fcs = frozenset(read_fcs)
+        self.protected_registers = dict(PROTECTED_SETPOINT_REGS if protected_registers is None else protected_registers)
         self.log_file = log_file
-        self.strict_write_lockdown = True
+        # Monitor mode: every violation is still inspected and logged, but the
+        # frame is forwarded, so a site can observe inline before enforcing.
+        self.enforce = enforce
         self.stats = {"inspected": 0, "allowed": 0, "blocked": 0}
 
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -117,36 +160,50 @@ class ModbusDPIProxy:
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
+    def _deny_action(self) -> str:
+        return "blocked" if self.enforce else "detected"
+
     def generate_exception_response(self, trans_id: int, unit_id: int, orig_fc: int, exc_code: int) -> bytes:
         mbap = trans_id.to_bytes(2, "big") + b"\x00\x00" + b"\x00\x03" + unit_id.to_bytes(1, "big")
         pdu = bytes([orig_fc | 0x80, exc_code])
         return mbap + pdu
 
-    def _check_setpoint_hazard(self, fc: int, raw_pkt: bytes) -> Optional[Tuple[int, int]]:
-        """Return (register, value) if a write pushes a protected setpoint
-        register (PROTECTED_SETPOINT_REGS) above the safe threshold, else None.
+    def _written_registers(self, fc: int, raw_pkt: bytes):
+        """Yield (register, value) pairs a write PDU would commit.
 
-        Handles both FC6 (Write Single Register) and FC16 (Write Multiple
-        Registers); FC16 can address a protected register inside a larger
-        block, so the whole written range is scanned.
+        FC6 carries one register; FC16 and FC23 carry a block (FC23 after its
+        read-range fields). The whole block is scanned so a protected register
+        cannot be hidden inside a bulk write.
         """
-        if fc == 6 and len(raw_pkt) >= 12:
-            reg_addr = int.from_bytes(raw_pkt[8:10], "big")
-            reg_val = int.from_bytes(raw_pkt[10:12], "big")
-            if reg_addr in PROTECTED_SETPOINT_REGS and reg_val > self.max_safe_high_threshold:
-                return reg_addr, reg_val
-        elif fc == 16 and len(raw_pkt) >= 13:
-            start_addr = int.from_bytes(raw_pkt[8:10], "big")
-            qty = int.from_bytes(raw_pkt[10:12], "big")
-            byte_count = raw_pkt[12]
-            for reg in PROTECTED_SETPOINT_REGS:
-                if not (start_addr <= reg < start_addr + qty):
-                    continue
-                off = 13 + (reg - start_addr) * 2
-                if off + 2 <= len(raw_pkt) and (off - 13) < byte_count:
-                    reg_val = int.from_bytes(raw_pkt[off:off + 2], "big")
-                    if reg_val > self.max_safe_high_threshold:
-                        return reg, reg_val
+        if fc == 6:
+            if len(raw_pkt) >= 12:
+                yield int.from_bytes(raw_pkt[8:10], "big"), int.from_bytes(raw_pkt[10:12], "big")
+            return
+        hdr = {16: 8, 23: 12}.get(fc)
+        if hdr is None or len(raw_pkt) < hdr + 5:
+            return
+        start = int.from_bytes(raw_pkt[hdr:hdr + 2], "big")
+        qty = int.from_bytes(raw_pkt[hdr + 2:hdr + 4], "big")
+        data = raw_pkt[hdr + 5:hdr + 5 + raw_pkt[hdr + 4]]
+        for i in range(min(qty, len(data) // 2)):
+            yield start + i, int.from_bytes(data[2 * i:2 * i + 2], "big")
+
+    def _check_setpoint_hazard(self, fc: int, raw_pkt: bytes) -> Optional[Tuple[int, Optional[int]]]:
+        """Return (register, value) if a write pushes a protected setpoint
+        register above the safe threshold, else None.
+
+        A masked write (FC22) to a protected register returns (register, None):
+        its result depends on the current value, which the gateway cannot see,
+        so it is refused outright.
+        """
+        if fc == 22 and len(raw_pkt) >= 10:
+            reg = int.from_bytes(raw_pkt[8:10], "big")
+            if reg in self.protected_registers:
+                return reg, None
+        for reg, val in self._written_registers(fc, raw_pkt):
+            limit = self.protected_registers.get(reg)
+            if limit is not None and val > limit:
+                return reg, val
         return None
 
     def inspect_request(self, raw_pkt: bytes, client_ip: str, client_port: int) -> Tuple[bool, Optional[bytes], str]:
@@ -163,21 +220,21 @@ class ModbusDPIProxy:
         if proto_id != 0:
             return False, None, f"Invalid Protocol ID 0x{proto_id:04X}"
 
-        is_write_fc = fc in [5, 6, 15, 16]
-
         # ----------------------------------------------------------------------
         # TIER 1: Function Code & Role-Based Authorization
+        # Read allowlist: only FC 01-04 are open to every host. Everything else
+        # requires the authorized EWS identity.
         # ----------------------------------------------------------------------
-        if is_write_fc and self.strict_write_lockdown and client_ip != self.authorized_ews_ip:
+        if fc not in self.read_fcs and client_ip not in self.authorized_ews_ips:
             self.stats["blocked"] += 1
-            reason = f"POLICY VIOLATION: Write Function Code {fc:02d} ({FC_NAMES.get(fc)}) denied from unauthorized IP {client_ip}"
+            reason = f"POLICY VIOLATION: Non-read Function Code {fc:02d} ({FC_NAMES.get(fc, 'Vendor/Unknown')}) denied from unauthorized IP {client_ip}"
             exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_FUNCTION)
 
             addr = int.from_bytes(raw_pkt[8:10], "big") if len(raw_pkt) >= 10 else 0
             val = int.from_bytes(raw_pkt[10:12], "big") if len(raw_pkt) >= 12 else 0
 
             self.emit_siem_event(
-                action="blocked",
+                action=self._deny_action(),
                 severity="high",
                 reason=reason,
                 client_ip=client_ip,
@@ -193,22 +250,28 @@ class ModbusDPIProxy:
 
         # ----------------------------------------------------------------------
         # TIER 2: Semantic Process Boundary Inspection
-        # Covers both Write Single Register (FC6) and Write Multiple Registers
-        # (FC16) so the protected high-setpoint register cannot be poisoned via
-        # the bulk-write path.
+        # Covers FC6, FC16 and FC23 writes to the protected setpoint registers
+        # and refuses FC22 masked writes to them, so the bulk, combined and
+        # masked paths cannot poison a setpoint either.
         # ----------------------------------------------------------------------
         hazard = self._check_setpoint_hazard(fc, raw_pkt)
         if hazard is not None:
             reg_addr, reg_val = hazard
             self.stats["blocked"] += 1
-            reason = (
-                f"CRITICAL PROCESS HAZARD: High Setpoint {reg_val} exceeds safe capacity "
-                f"({self.max_safe_high_threshold}). Potential loss-of-containment attack."
-            )
+            if reg_val is None:
+                reason = (
+                    f"CRITICAL PROCESS HAZARD: Masked write to protected setpoint register {reg_addr} refused; "
+                    "the resulting value cannot be verified."
+                )
+            else:
+                reason = (
+                    f"CRITICAL PROCESS HAZARD: Setpoint register {reg_addr} = {reg_val} exceeds safe capacity "
+                    f"({self.protected_registers[reg_addr]}). Potential loss-of-containment attack."
+                )
             exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_DATA_VALUE)
 
             self.emit_siem_event(
-                action="blocked",
+                action=self._deny_action(),
                 severity="critical",
                 reason=reason,
                 client_ip=client_ip,
@@ -218,7 +281,7 @@ class ModbusDPIProxy:
                 fc=fc,
                 mitre_technique_id="T0836",
                 mitre_technique_name="Modify Parameter",
-                payload_details={"target_register": reg_addr, "attempted_value": reg_val, "safe_limit": self.max_safe_high_threshold}
+                payload_details={"target_register": reg_addr, "attempted_value": reg_val, "safe_limit": self.protected_registers[reg_addr]}
             )
             return False, exc_resp, reason
 
@@ -310,6 +373,9 @@ class ModbusDPIProxy:
             is_allowed, synthetic_resp, reason = self.inspect_request(adu, client_ip, client_port)
             if is_allowed:
                 backend_sock.sendall(adu)
+            elif not self.enforce:
+                logger.warning(f"[MONITOR] Would block, forwarding anyway. Reason: {reason}")
+                backend_sock.sendall(adu)
             else:
                 logger.warning(f"[BLOCKED] Packet dropped! Reason: {reason}")
                 if synthetic_resp:
@@ -324,6 +390,8 @@ class ModbusDPIProxy:
         logger.info("=" * 70)
         logger.info(f"Modbus L7 DPI Proxy ACTIVE on {self.listen_host}:{self.listen_port}")
         logger.info(f"SIEM Structured Logging: {os.path.abspath(self.log_file)}")
+        logger.info(f"Authorized EWS: {sorted(self.authorized_ews_ips)} | open FCs: {sorted(self.read_fcs)} | protected registers: {self.protected_registers}")
+        logger.info(f"Mode: {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
         logger.info("=" * 70)
 
         try:
@@ -345,16 +413,22 @@ if __name__ == "__main__":
     parser.add_argument("--listen-port", type=int, default=5020, help="Listen port (default: 5020)")
     parser.add_argument("--backend-host", type=str, default="127.0.0.1", help="Backend PLC IP (default: 127.0.0.1)")
     parser.add_argument("--backend-port", type=int, default=502, help="Backend PLC port (default: 502)")
-    parser.add_argument("--authorized-ip", type=str, default="192.168.1.50", help="Authorized EWS IP (default: 192.168.1.50)")
+    parser.add_argument("--policy", type=str, help="JSON policy file (see modbus_policy.json); explicit CLI flags override it")
+    parser.add_argument("--authorized-ip", action="append", default=None, help="Authorized EWS IP; repeatable (default: 192.168.1.50)")
     parser.add_argument("--log-file", type=str, default="logs/ot_security_events.jsonl", help="SIEM event log path")
+    parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
     args = parser.parse_args()
 
+    policy = load_policy(args.policy) if args.policy else {}
     proxy = ModbusDPIProxy(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
         backend_host=args.backend_host,
         backend_port=args.backend_port,
-        authorized_ews_ip=args.authorized_ip,
-        log_file=args.log_file
+        authorized_ews_ips=args.authorized_ip or policy.get("authorized_ews_ips", ["192.168.1.50"]),
+        read_fcs=policy.get("read_function_codes", READ_FCS),
+        protected_registers=policy.get("protected_registers"),
+        log_file=args.log_file,
+        enforce=policy.get("enforce", True) and not args.monitor
     )
     proxy.start_proxy()

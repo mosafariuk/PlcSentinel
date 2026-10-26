@@ -36,7 +36,8 @@ def load_all_events():
 
 def render_unified_dashboard(events):
     total = len(events)
-    blocked = [e for e in events if e.get("event", {}).get("action") == "blocked"]
+    # "detected" = a violation seen by a gateway running in monitor mode.
+    blocked = [e for e in events if e.get("event", {}).get("action") in ("blocked", "detected")]
     allowed = [e for e in events if e.get("event", {}).get("action") == "allowed"]
 
     severities = Counter([e.get("event", {}).get("severity_label", "info").upper() for e in events])
@@ -70,7 +71,7 @@ def render_unified_dashboard(events):
     for e in reversed(recent):
         ts = e.get("@timestamp", "")[:19].replace("T", " ")
         action = e.get("event", {}).get("action", "").upper()
-        color = "\033[91m" if action == "BLOCKED" else "\033[92m"
+        color = {"BLOCKED": "\033[91m", "DETECTED": "\033[93m"}.get(action, "\033[92m")
         reset = "\033[0m"
         proto = e.get("network", {}).get("protocol", "").replace("_tcp", "").upper()
         
