@@ -18,6 +18,7 @@ Architectural Role:
 import os
 import sys
 import json
+import ssl
 import socket
 import asyncio
 import logging
@@ -26,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any
 
 from dpi_limits import SourceLimiter
+from dpi_tls import server_context, peer_principal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,6 +84,7 @@ OPEN_USERDATA = frozenset({(4, 1)})
 # JSON policy file keys and their types; CLI flags override file values.
 POLICY_KEYS = {
     "authorized_ews_ips": list,
+    "authorized_ews_identities": list,
     "open_functions": list,
     "open_userdata": list,
     "max_sessions_per_source": int,
@@ -235,19 +238,26 @@ class S7DPIProxy:
         backend_host: str = "127.0.0.1",
         backend_port: int = 102,
         authorized_ews_ips=("192.168.1.50",),
+        authorized_ews_identities=(),
         open_fcs=OPEN_FCS,
         open_userdata=OPEN_USERDATA,
         log_file: str = "logs/s7_security_events.jsonl",
         enforce: bool = True,
         max_sessions_per_source: int = 8,
         max_requests_per_second: int = 200,
-        siem_udp: Optional[Tuple[str, int]] = None
+        siem_udp: Optional[Tuple[str, int]] = None,
+        tls_port: Optional[int] = None,
+        tls_cert: str = "certs/gateway_cert.pem",
+        tls_key: str = "certs/gateway_key.pem",
+        tls_ca: str = "certs/gateway_ca_cert.pem"
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.backend_host = backend_host
         self.backend_port = backend_port
-        self.authorized_ews_ips = frozenset(authorized_ews_ips)
+        # A principal is a source IP (plain listener) or "cn:<CommonName>" of a
+        # client certificate issued by the lab CA (mutual-TLS listener).
+        self.authorized_principals = frozenset(authorized_ews_ips) | frozenset(f"cn:{c}" for c in authorized_ews_identities)
         self.open_fcs = frozenset(open_fcs)
         self.open_userdata = frozenset(tuple(x) for x in open_userdata)
         self.log_file = log_file
@@ -256,6 +266,11 @@ class S7DPIProxy:
         self.limiter = SourceLimiter(max_sessions_per_source, max_requests_per_second)
         self._siem_udp = siem_udp
         self._siem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if siem_udp else None
+        self.tls_port = tls_port
+        try:
+            self._tls_ctx = server_context(tls_cert, tls_key, tls_ca) if tls_port is not None else None
+        except (OSError, ssl.SSLError) as e:
+            raise SystemExit(f"[FATAL] Cannot load TLS material for the mutual-TLS listener: {e}")
 
         self.stats = {"sessions": 0, "packets": 0, "allowed": 0, "blocked": 0}
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -269,7 +284,8 @@ class S7DPIProxy:
         client_port: int,
         mitre_id: Optional[str] = None,
         mitre_name: Optional[str] = None,
-        s7_details: Optional[Dict[str, Any]] = None
+        s7_details: Optional[Dict[str, Any]] = None,
+        principal: Optional[str] = None
     ):
         """Emits an Elastic Common Schema (ECS) JSON event log."""
         event = {
@@ -295,6 +311,8 @@ class S7DPIProxy:
                 }
             }
         }
+        if principal and principal.startswith("cn:"):
+            event["user"] = {"name": principal[3:]}
         line = json.dumps(event) + "\n"
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(line)
@@ -316,11 +334,13 @@ class S7DPIProxy:
             s7_details={"max_sessions": self.limiter.max_sessions, "max_requests_per_second": self.limiter.max_rps}
         )
 
-    def evaluate_policy(self, parsed: Dict[str, Any], client_ip: str, client_port: int) -> Tuple[bool, str]:
+    def evaluate_policy(self, parsed: Dict[str, Any], client_ip: str, client_port: int,
+                        principal: Optional[str] = None) -> Tuple[bool, str]:
         """
         Layer-7 Policy Evaluation for a single, fully-framed S7comm PDU.
         Returns: (is_allowed: bool, reason: str)
         """
+        principal = principal or client_ip
         self.stats["packets"] += 1
         fc = parsed.get("function_code")
         fc_name = parsed.get("function_name", "Unknown")
@@ -340,12 +360,13 @@ class S7DPIProxy:
                 client_port=client_port,
                 mitre_id="T0805",
                 mitre_name="Point & Physical Device Control / CPU Stop",
-                s7_details={"function_code": fc, "function_name": fc_name}
+                s7_details={"function_code": fc, "function_name": fc_name},
+                principal=principal
             )
             return False, reason
 
         # The authorized Engineering Workstation may issue anything but CPU Stop.
-        if client_ip in self.authorized_ews_ips:
+        if principal in self.authorized_principals:
             self.stats["allowed"] += 1
             return True, "ALLOW"
 
@@ -357,7 +378,7 @@ class S7DPIProxy:
         if fc in EWS_ONLY_FCS:
             mitre_id, mitre_name = EWS_ONLY_FCS[fc]
             self.stats["blocked"] += 1
-            reason = f"CRITICAL ATTACK: Unauthorized S7comm {fc_name} from non-EWS IP {client_ip}!"
+            reason = f"CRITICAL ATTACK: Unauthorized S7comm {fc_name} from unauthorized principal {principal}!"
             self.log_ecs_event(
                 action=self._deny_action(),
                 severity="critical",
@@ -366,7 +387,8 @@ class S7DPIProxy:
                 client_port=client_port,
                 mitre_id=mitre_id,
                 mitre_name=mitre_name,
-                s7_details={"function_code": fc, "function_name": fc_name}
+                s7_details={"function_code": fc, "function_name": fc_name},
+                principal=principal
             )
             return False, reason
 
@@ -380,7 +402,7 @@ class S7DPIProxy:
             self.stats["blocked"] += 1
             reason = (
                 f"POLICY VIOLATION: Unauthorized S7comm Write targeting {item.get('area_name', 'unknown area')} "
-                f"(DB{item.get('db_number')}.DBB{item.get('byte_offset')}) from IP {client_ip}!"
+                f"(DB{item.get('db_number')}.DBB{item.get('byte_offset')}) from unauthorized principal {principal}!"
             )
             self.log_ecs_event(
                 action=self._deny_action(),
@@ -390,7 +412,8 @@ class S7DPIProxy:
                 client_port=client_port,
                 mitre_id="T0855",
                 mitre_name="Unauthorized Command Message",
-                s7_details={"function_code": fc, "function_name": fc_name, "target_item": item}
+                s7_details={"function_code": fc, "function_name": fc_name, "target_item": item},
+                principal=principal
             )
             return False, reason
 
@@ -406,7 +429,7 @@ class S7DPIProxy:
         self.stats["blocked"] += 1
         reason = (
             f"POLICY VIOLATION: S7comm {fc_name or parsed.get('msg_type_name')} is not a read operation; "
-            f"denied from non-EWS IP {client_ip}!"
+            f"denied for unauthorized principal {principal}!"
         )
         self.log_ecs_event(
             action=self._deny_action(),
@@ -416,11 +439,13 @@ class S7DPIProxy:
             client_port=client_port,
             mitre_id="T0855",
             mitre_name="Unauthorized Command Message",
-            s7_details={"function_code": fc, "function_name": fc_name, "msg_type": parsed.get("msg_type")}
+            s7_details={"function_code": fc, "function_name": fc_name, "msg_type": parsed.get("msg_type")},
+            principal=principal
         )
         return False, reason
 
-    def _frame_client_stream(self, buf: bytes, client_ip: str, client_port: int) -> Tuple[bytes, bytes, Optional[str]]:
+    def _frame_client_stream(self, buf: bytes, client_ip: str, client_port: int,
+                             principal: Optional[str] = None) -> Tuple[bytes, bytes, Optional[str]]:
         """Extract complete TPKT messages from the client byte stream and inspect each.
 
         S7comm runs over ISO-on-TCP, a byte stream: a single read may hold several
@@ -456,7 +481,7 @@ class S7DPIProxy:
                 out += msg
                 continue
 
-            allowed, reason = self.evaluate_policy(parsed, client_ip, client_port)
+            allowed, reason = self.evaluate_policy(parsed, client_ip, client_port, principal)
             if not allowed and self.enforce:
                 return out, buf, reason
             if not allowed:
@@ -464,7 +489,8 @@ class S7DPIProxy:
             out += msg
         return out, buf, None
 
-    async def pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, is_client: bool, client_ip: str, client_port: int):
+    async def pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, is_client: bool,
+                   client_ip: str, client_port: int, principal: Optional[str] = None):
         """Asynchronously pipes data between client and backend with Layer-7 DPI."""
         buf = b""
         try:
@@ -480,7 +506,7 @@ class S7DPIProxy:
                     continue
 
                 buf += data
-                out, buf, drop_reason = self._frame_client_stream(buf, client_ip, client_port)
+                out, buf, drop_reason = self._frame_client_stream(buf, client_ip, client_port, principal)
                 if out:
                     writer.write(out)
                     await writer.drain()
@@ -504,7 +530,16 @@ class S7DPIProxy:
         self.stats["sessions"] += 1
         client_addr = client_writer.get_extra_info("peername")
         client_ip, client_port = client_addr[0], client_addr[1]
-        logger.info(f"[+] Incoming S7 session accepted from {client_ip}:{client_port}")
+        principal = None
+        ssl_object = client_writer.get_extra_info("ssl_object")
+        if ssl_object is not None:
+            principal = peer_principal(ssl_object.getpeercert())
+            if principal is None:
+                logger.warning(f"[BLOCKED] TLS client {client_ip}:{client_port} presented a certificate without a Common Name")
+                client_writer.close()
+                await client_writer.wait_closed()
+                return
+        logger.info(f"[+] Incoming S7 session accepted from {client_ip}:{client_port}" + (f" as {principal}" if principal else ""))
         if not self.limiter.open_session(client_ip):
             self._emit_limit_event(client_ip, client_port,
                                    f"Session cap: {self.limiter.max_sessions} sessions already open from {client_ip}; refusing another")
@@ -512,11 +547,12 @@ class S7DPIProxy:
             await client_writer.wait_closed()
             return
         try:
-            await self._serve_session(client_reader, client_writer, client_ip, client_port)
+            await self._serve_session(client_reader, client_writer, client_ip, client_port, principal)
         finally:
             self.limiter.close_session(client_ip)
 
-    async def _serve_session(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, client_ip: str, client_port: int):
+    async def _serve_session(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter,
+                             client_ip: str, client_port: int, principal: Optional[str] = None):
         # Connect to backend Siemens PLC
         try:
             plc_reader, plc_writer = await asyncio.wait_for(
@@ -531,7 +567,7 @@ class S7DPIProxy:
 
         # Bi-directional asynchronous piping
         client_to_plc = asyncio.create_task(
-            self.pipe(client_reader, plc_writer, is_client=True, client_ip=client_ip, client_port=client_port)
+            self.pipe(client_reader, plc_writer, is_client=True, client_ip=client_ip, client_port=client_port, principal=principal)
         )
         plc_to_client = asyncio.create_task(
             self.pipe(plc_reader, client_writer, is_client=False, client_ip=client_ip, client_port=client_port)
@@ -541,22 +577,25 @@ class S7DPIProxy:
         logger.info(f"[*] S7 session closed for {client_ip}:{client_port} | Total Stats: {self.stats}")
 
     async def start(self):
-        server = await asyncio.start_server(
-            self.handle_client,
-            self.listen_host,
-            self.listen_port
-        )
+        servers = [await asyncio.start_server(self.handle_client, self.listen_host, self.listen_port)]
+        if self._tls_ctx:
+            servers.append(await asyncio.start_server(self.handle_client, self.listen_host, self.tls_port, ssl=self._tls_ctx))
         logger.info("=" * 72)
         logger.info(f"S7comm Layer-7 DPI Proxy ACTIVE on {self.listen_host}:{self.listen_port}")
+        if self._tls_ctx:
+            logger.info(f"Mutual-TLS listener (reach it with ews_tls_tunnel.py) on {self.listen_host}:{self.tls_port}")
         logger.info(f"Forwarding sanitized traffic to Siemens PLC at {self.backend_host}:{self.backend_port}")
-        logger.info(f"Authorized Engineering Stations   : {sorted(self.authorized_ews_ips)}")
+        logger.info(f"Authorized principals             : {sorted(self.authorized_principals)}")
         logger.info(f"Open to every host                : jobs {sorted(f'0x{x:02X}' for x in self.open_fcs)}, userdata {sorted(self.open_userdata)}")
         logger.info(f"SIEM Structured Logging           : {os.path.abspath(self.log_file)}")
         logger.info(f"Mode                              : {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
         logger.info("=" * 72)
 
-        async with server:
-            await server.serve_forever()
+        try:
+            await asyncio.gather(*(s.serve_forever() for s in servers))
+        finally:
+            for s in servers:
+                s.close()
 
 
 if __name__ == "__main__":
@@ -570,6 +609,10 @@ if __name__ == "__main__":
     parser.add_argument("--log-file", type=str, default="logs/s7_security_events.jsonl", help="SIEM event output path")
     parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
     parser.add_argument("--siem-udp", type=str, metavar="HOST:PORT", help="Also send every event as a JSON datagram to this collector (Elastic/Logstash/Wazuh)")
+    parser.add_argument("--tls-port", type=int, default=None, help="Also listen for mutual-TLS sessions (ews_tls_tunnel.py) on this port, e.g. 10202; client certificate CN is the principal")
+    parser.add_argument("--tls-cert", type=str, default="certs/gateway_cert.pem", help="Gateway certificate (PEM)")
+    parser.add_argument("--tls-key", type=str, default="certs/gateway_key.pem", help="Gateway private key (PEM)")
+    parser.add_argument("--tls-ca", type=str, default="certs/gateway_ca_cert.pem", help="CA that issues client certificates (PEM)")
     args = parser.parse_args()
 
     policy = load_policy(args.policy) if args.policy else {}
@@ -583,13 +626,18 @@ if __name__ == "__main__":
         backend_host=args.backend_host,
         backend_port=args.backend_port,
         authorized_ews_ips=args.authorized_ews or policy.get("authorized_ews_ips", ["192.168.1.50"]),
+        authorized_ews_identities=policy.get("authorized_ews_identities", []),
         open_fcs=policy.get("open_functions", OPEN_FCS),
         open_userdata=policy.get("open_userdata", OPEN_USERDATA),
         log_file=args.log_file,
         enforce=policy.get("enforce", True) and not args.monitor,
         max_sessions_per_source=policy.get("max_sessions_per_source", 8),
         max_requests_per_second=policy.get("max_requests_per_second", 200),
-        siem_udp=siem_udp
+        siem_udp=siem_udp,
+        tls_port=args.tls_port,
+        tls_cert=args.tls_cert,
+        tls_key=args.tls_key,
+        tls_ca=args.tls_ca
     )
     try:
         asyncio.run(proxy.start())
