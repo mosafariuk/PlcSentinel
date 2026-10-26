@@ -49,6 +49,7 @@
    * Only read operations are open to every host. Writes, masked and combined writes, diagnostics, vendor codes, logic transfers and S7 UserData requests (other than status reads) require the authorized engineering-workstation identity.
    * Synthesizes RFC-compliant Modbus Exceptions (`0x01` Illegal Function, `0x03` Illegal Data Value).
    * Enforces semantic process safety boundaries (e.g. overfill protection thresholds).
+   * `--monitor` runs either gateway inline in detect-only mode: violations are logged as `detected` and forwarded, so a site can observe before enforcing.
    * Note: the Modbus/S7 conduits authorize by **source IP** — a compensating control for unauthenticated legacy protocols, not a cryptographic identity. OPC UA is the mutually-authenticated path.
 3. **Unified OT SOC Threat Dashboard:**
    * Console-based SIEM dashboard ([soc_dashboard.py](soc_dashboard.py)) streaming structured **Elastic Common Schema (ECS)** logs enriched with MITRE ATT&CK for ICS tags (`T0855`, `T0836`, `T0805`).
