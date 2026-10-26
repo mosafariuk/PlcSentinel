@@ -177,9 +177,11 @@ class ModbusTlsIdentityTests(unittest.TestCase):
 class S7TlsIdentityTests(unittest.TestCase):
     """S7comm has no native TLS: the gateway's TLS listener authorizes the certificate CN."""
 
-    # Job: Write Var, one S7ANY item addressing DB1, framed in S7 header + COTP DT + TPKT.
-    _PARAM = b"\x05\x01" + b"\x12\x0a\x10\x02\x00\x01\x00\x01\x84\x00\x00\x00"
-    _BODY = b"\x02\xf0\x80" + b"\x32\x01\x00\x00\x00\x01" + len(_PARAM).to_bytes(2, "big") + b"\x00\x00" + _PARAM
+    # Job: Write Var, one S7ANY item addressing DB1.DBW0 with a 2-byte data section (value 840).
+    _PARAM = b"\x05\x01" + b"\x12\x0a\x10\x02\x00\x02\x00\x01\x84\x00\x00\x00"
+    _DATA = b"\x00\x04\x00\x10\x03\x48"
+    _BODY = (b"\x02\xf0\x80" + b"\x32\x01\x00\x00\x00\x01" + len(_PARAM).to_bytes(2, "big")
+             + len(_DATA).to_bytes(2, "big") + _PARAM + _DATA)
     WRITE_DB1 = b"\x03\x00" + (len(_BODY) + 4).to_bytes(2, "big") + _BODY
 
     @classmethod

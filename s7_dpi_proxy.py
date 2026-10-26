@@ -90,6 +90,7 @@ POLICY_KEYS = {
     "max_sessions_per_source": int,
     "max_requests_per_second": int,
     "change_windows": list,
+    "protected_db_words": list,
     "enforce": bool,
 }
 
@@ -129,8 +130,13 @@ def load_policy(path: str) -> Dict[str, Any]:
             policy["open_userdata"] = {(int(g), int(s)) for g, s in policy["open_userdata"]}
         if "change_windows" in policy:
             policy["change_windows"] = [_parse_window(w) for w in policy["change_windows"]]
-    except (TypeError, ValueError) as e:
-        raise SystemExit(f"[FATAL] Policy file {path}: open_functions must be integers and open_userdata [group, subfunction] pairs ({e})")
+        if "protected_db_words" in policy:
+            policy["protected_db_words"] = [
+                {"db": int(w["db"]), "offset": int(w["offset"]), "min": int(w.get("min", 0)), "max": int(w["max"])}
+                for w in policy["protected_db_words"]]
+    except (TypeError, ValueError, KeyError) as e:
+        raise SystemExit(f"[FATAL] Policy file {path}: open_functions must be integers, open_userdata [group, subfunction] pairs, "
+                         f"protected_db_words objects with db, offset, max (and optional min) ({e})")
     return policy
 
 # S7 Memory Area Codes
@@ -235,6 +241,19 @@ class S7PacketParser:
                         "bit_offset": bit_address & 0x07
                     })
                     item_offset += 12
+
+                # Data section, one entry per item: reserved, transport size,
+                # length (bits for sizes 3..6, bytes otherwise), payload, even padding.
+                d = s7_offset + 10 + param_len
+                for item in dissection["write_items"]:
+                    if len(raw) < d + 4:
+                        return None
+                    transport, length = raw[d + 1], int.from_bytes(raw[d + 2:d + 4], "big")
+                    nbytes = (length + 7) // 8 if transport in (3, 4, 5, 6) else length
+                    if len(raw) < d + 4 + nbytes:
+                        return None
+                    item["data"] = raw[d + 4:d + 4 + nbytes]
+                    d += 4 + nbytes + (nbytes & 1)
         elif msg_type == 0x07 and param_len >= 8 and len(raw) >= s7_offset + 17:
             # UserData parameter: 00 01 12 | len | method | type<<4 | group | subfunction | seq
             group, subfunction = raw[s7_offset + 15] & 0x0F, raw[s7_offset + 16]
@@ -260,6 +279,7 @@ class S7DPIProxy:
         open_fcs=OPEN_FCS,
         open_userdata=OPEN_USERDATA,
         change_windows=None,
+        protected_db_words=(),
         log_file: str = "logs/s7_security_events.jsonl",
         enforce: bool = True,
         max_sessions_per_source: int = 8,
@@ -282,6 +302,8 @@ class S7DPIProxy:
         # None: logic transfers by the EWS are only logged. A list (even empty):
         # they are refused unless a window for that principal is open now.
         self.change_windows = None if change_windows is None else list(change_windows)
+        # Signed 16-bit DB words that may not leave [min, max], whoever writes them.
+        self.protected_db_words = [dict(w) for w in protected_db_words]
         self.log_file = log_file
         # Monitor mode: violations are inspected and logged but forwarded.
         self.enforce = enforce
@@ -335,7 +357,8 @@ class S7DPIProxy:
         }
         if principal and principal.startswith("cn:"):
             event["user"] = {"name": principal[3:]}
-        line = json.dumps(event) + "\n"
+        # Write Var items carry raw payload bytes; log them as hex.
+        line = json.dumps(event, default=lambda o: o.hex() if isinstance(o, (bytes, bytearray)) else str(o)) + "\n"
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(line)
         if self._siem_sock:
@@ -355,6 +378,20 @@ class S7DPIProxy:
             mitre_id="T0814", mitre_name="Denial of Service",
             s7_details={"max_sessions": self.limiter.max_sessions, "max_requests_per_second": self.limiter.max_rps}
         )
+
+    def _check_db_word_hazard(self, items) -> Optional[Tuple[Dict[str, int], int]]:
+        """Return (rule, value) for the first protected DB word a write would push out of range."""
+        for item in items:
+            data = item.get("data")
+            if item.get("area_code") != 0x84 or data is None:
+                continue
+            for rule in self.protected_db_words:
+                rel = rule["offset"] - item["byte_offset"]
+                if rule["db"] == item["db_number"] and 0 <= rel and rel + 2 <= len(data):
+                    value = int.from_bytes(data[rel:rel + 2], "big", signed=True)
+                    if not (rule["min"] <= value <= rule["max"]):
+                        return rule, value
+        return None
 
     def _window_open(self, principal: str, now: Optional[datetime] = None) -> bool:
         now = now or datetime.now(timezone.utc)
@@ -390,6 +427,25 @@ class S7DPIProxy:
                 principal=principal
             )
             return False, reason
+
+        # ----------------------------------------------------------------------
+        # POLICY RULE 1b: SETPOINT BOUNDS (MITRE T0836), for every principal.
+        # A protected DB word may not leave its safe range, whoever writes it.
+        # ----------------------------------------------------------------------
+        if fc == S7_FC_WRITE_VAR:
+            hazard = self._check_db_word_hazard(parsed.get("write_items", []))
+            if hazard is not None:
+                rule, value = hazard
+                self.stats["blocked"] += 1
+                reason = (f"CRITICAL PROCESS HAZARD: DB{rule['db']}.DBW{rule['offset']} = {value} is outside the safe range "
+                          f"[{rule['min']} .. {rule['max']}] (requested by {principal})")
+                self.log_ecs_event(
+                    action=self._deny_action(), severity="critical", reason=reason, client_ip=client_ip, client_port=client_port,
+                    mitre_id="T0836", mitre_name="Modify Parameter",
+                    s7_details={"function_code": fc, "function_name": fc_name, "target": rule, "attempted_value": value},
+                    principal=principal
+                )
+                return False, reason
 
         # The authorized Engineering Workstation may issue anything but CPU Stop.
         # Logic transfers and run-mode changes additionally need an open change
@@ -626,6 +682,7 @@ class S7DPIProxy:
         logger.info(f"Forwarding sanitized traffic to Siemens PLC at {self.backend_host}:{self.backend_port}")
         logger.info(f"Authorized principals             : {sorted(self.authorized_principals)}")
         logger.info(f"Open to every host                : jobs {sorted(f'0x{x:02X}' for x in self.open_fcs)}, userdata {sorted(self.open_userdata)}")
+        logger.info(f"Protected DB words                : {self.protected_db_words or 'none'}")
         logger.info(f"Change windows                    : {'not enforced (logic transfers logged only)' if self.change_windows is None else f'{len(self.change_windows)} declared, two-person rule'}")
         logger.info(f"SIEM Structured Logging           : {os.path.abspath(self.log_file)}")
         logger.info(f"Mode                              : {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
@@ -670,6 +727,7 @@ if __name__ == "__main__":
         open_fcs=policy.get("open_functions", OPEN_FCS),
         open_userdata=policy.get("open_userdata", OPEN_USERDATA),
         change_windows=policy.get("change_windows"),
+        protected_db_words=policy.get("protected_db_words", []),
         log_file=args.log_file,
         enforce=policy.get("enforce", True) and not args.monitor,
         max_sessions_per_source=policy.get("max_sessions_per_source", 8),

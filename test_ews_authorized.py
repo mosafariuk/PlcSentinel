@@ -15,6 +15,8 @@ import os
 import sys
 import logging
 from pymodbus.client import ModbusTcpClient
+from snap7.client import Client
+from snap7.util import set_int
 from s7_sentinel import S7Sentinel
 
 MODBUS_PROXY = os.environ.get("MODBUS_PROXY", "192.168.1.100")
@@ -68,6 +70,23 @@ def run_tests():
         sentinel.write_safe_setpoint(db_number=1, byte_offset=0, new_value=850)  # restore baseline
     finally:
         sentinel.disconnect()
+
+    logger.info("\n=== STEP 3: EWS WRITE OUTSIDE THE SAFE RANGE (DB1.DBW0 = 9999) IS STILL REFUSED ===")
+    raw = Client()
+    try:
+        raw.connect(S7_PROXY, 0, 1, tcp_port=10200)
+        buf = bytearray(2)
+        set_int(buf, 0, 9999)
+        raw.db_write(1, 0, buf)
+        logger.error("[FAIL] Gateway forwarded an out-of-range setpoint from the EWS")
+        failures += 1
+    except Exception as e:
+        logger.info(f"[SUCCESS - MITIGATED] Out-of-range EWS write refused and session closed ({e})")
+    finally:
+        try:
+            raw.disconnect()
+        except Exception:
+            pass
 
     logger.info("\n" + "=" * 65)
     if failures == 0:
