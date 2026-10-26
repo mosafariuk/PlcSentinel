@@ -8,6 +8,7 @@ Validates active mitigation against MITRE ATT&CK for ICS scenarios:
 - Confirms OpenPLC process memory remains intact and protected
 """
 
+import sys
 import time
 import logging
 from pymodbus.client import ModbusTcpClient
@@ -32,6 +33,8 @@ def run_tests():
         return False
     logger.info(f"[PASS] Telemetry Read via Proxy SUCCESS: High={res_read.registers[0]}, Low={res_read.registers[1]}")
 
+    failures = 0
+
     logger.info("\n=== STEP 2: ATTACK SIMULATION - UNAUTHORIZED WRITE COIL (FC 05) ===")
     logger.warning("Attempting to force Drain Valve OPEN (Coil 1) through DPI Proxy...")
     res_coil = client_dpi.write_coil(address=1, value=True, device_id=1)
@@ -40,6 +43,7 @@ def run_tests():
         logger.info("[SUCCESS - MITIGATED] DPI Proxy successfully BLOCKED unauthorized coil manipulation!")
     else:
         logger.error("[FAIL] DPI Proxy allowed unauthorized write coil!")
+        failures += 1
 
     logger.info("\n=== STEP 3: ATTACK SIMULATION - SETPOINT POISONING (FC 06) ===")
     logger.warning("Attempting to overwrite High Threshold to 9999 (Overfill Hazard)...")
@@ -49,28 +53,43 @@ def run_tests():
         logger.info("[SUCCESS - MITIGATED] DPI Proxy successfully BLOCKED out-of-bounds setpoint poisoning!")
     else:
         logger.error("[FAIL] DPI Proxy allowed malicious setpoint!")
+        failures += 1
 
     client_dpi.close()
 
     logger.info("\n=== STEP 4: HARDWARE INTEGRITY AUDIT (DIRECT TO OPENPLC PORT 502) ===")
     logger.info("Connecting directly to OpenPLC to verify process state integrity...")
     client_direct = ModbusTcpClient("127.0.0.1", port=DIRECT_PLC_PORT)
-    client_direct.connect()
-    
-    coils_direct = client_direct.read_coils(address=0, count=4, device_id=1).bits[:4]
-    regs_direct = client_direct.read_holding_registers(address=0, count=2, device_id=1).registers
-    client_direct.close()
-
-    logger.info(f"Actual PLC Drain Valve State: {'OPEN (COMPROMISED)' if coils_direct[1] else 'CLOSED (SAFE)'}")
-    logger.info(f"Actual PLC High Setpoint: {regs_direct[0]} ({regs_direct[0]/10.0:.1f}%)")
-
-    assert coils_direct[1] is False, "INTEGRITY ERROR: Drain valve was compromised!"
-    assert regs_direct[0] <= 900, "INTEGRITY ERROR: High setpoint was poisoned!"
+    if not client_direct.connect():
+        # docker-compose deliberately does not publish 502; only the standalone
+        # lab (make run-modbus-lab) exposes it, so skip rather than crash.
+        logger.warning(f"Direct PLC port {DIRECT_PLC_PORT} not reachable; skipping integrity audit (expected under docker-compose).")
+    else:
+        res_c = client_direct.read_coils(address=0, count=4, device_id=1)
+        res_r = client_direct.read_holding_registers(address=0, count=2, device_id=1)
+        client_direct.close()
+        if res_c.isError() or res_r.isError():
+            logger.error(f"[FAIL] Direct PLC read failed: coils={res_c} regs={res_r}")
+            failures += 1
+        else:
+            coils_direct = res_c.bits[:4]
+            regs_direct = res_r.registers
+            logger.info(f"Actual PLC Drain Valve State: {'OPEN (COMPROMISED)' if coils_direct[1] else 'CLOSED (SAFE)'}")
+            logger.info(f"Actual PLC High Setpoint: {regs_direct[0]} ({regs_direct[0]/10.0:.1f}%)")
+            if coils_direct[1]:
+                logger.error("[FAIL] INTEGRITY ERROR: Drain valve was compromised!")
+                failures += 1
+            if regs_direct[0] > 900:
+                logger.error("[FAIL] INTEGRITY ERROR: High setpoint was poisoned!")
+                failures += 1
 
     logger.info("\n" + "=" * 60)
-    logger.info("AUDIT VERDICT: ZERO PROCESS IMPACT. ALL ATTACKS BLOCKED BY DPI GATEWAY.")
+    if failures == 0:
+        logger.info("AUDIT VERDICT: ZERO PROCESS IMPACT. ALL ATTACKS BLOCKED BY DPI GATEWAY.")
+    else:
+        logger.error(f"AUDIT VERDICT: {failures} CHECK(S) FAILED. DPI MITIGATION INCOMPLETE.")
     logger.info("=" * 60)
-    return True
+    return failures == 0
 
 if __name__ == "__main__":
-    run_tests()
+    sys.exit(0 if run_tests() else 1)

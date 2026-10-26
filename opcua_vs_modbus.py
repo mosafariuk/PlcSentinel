@@ -14,7 +14,7 @@ def print_comparison():
     print(f"| {'Port & Transport':<24} | {'Port 502 / Raw TCP':<24} | {'Port 4840 / TCP Binary':<24} |")
     print(f"| {'Authentication (FR 1)':<24} | {'NONE (Unauthenticated)':<24} | {'X.509 Mutual PKI / User':<24} |")
     print(f"| {'Access Control (FR 2)':<24} | {'Any client can write':<24} | {'Node-level ACLs & Roles':<24} |")
-    print(f"| {'Integrity (FR 3)':<24} | {'None (TCP checksum only)':<24} | {'HMAC-SHA256 Signatures':<24} |")
+    print(f"| {'Integrity (FR 3)':<24} | {'None (TCP checksum only)':<24} | {'RSA/HMAC-SHA256 Signing':<24} |")
     print(f"| {'Confidentiality (FR 4)':<24} | {'PLAINTEXT (Sniffable)':<24} | {'AES-256-CBC Encryption':<24} |")
     print(f"| {'Replay Protection':<24} | {'Vulnerable (No Nonce)':<24} | {'Sequence IDs & Nonces':<24} |")
     print(f"| {'IEC 62443 Max SL':<24} | {'SL 1 (Requires Gateway)':<24} | {'SL 3 / SL 4 Native':<24} |")

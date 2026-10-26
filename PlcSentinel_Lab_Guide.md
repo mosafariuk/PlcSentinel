@@ -10,7 +10,7 @@
 
 | Day | Focus Area | Deliverables & Milestones |
 | :--- | :--- | :--- |
-| **Day 1** | **Environment & Architecture** | Deploy OpenPLC runtime via Docker; install OpenPLC Editor; verify Web GUI on port 8080 and Modbus on port 502. |
+| **Day 1** | **Environment & Architecture** | Deploy OpenPLC runtime via Docker; install OpenPLC Editor; verify Web GUI on port 8081 and Modbus on port 502. |
 | **Day 2** | **PLC Logic Programming** | Write and compile IEC 61131-3 logic (Structured Text / Ladder); map variables to Modbus memory table (`%IX`, `%QX`, `%IW`, `%QW`). |
 | **Day 3** | **Modbus TCP Protocol Dissection** | Set up Wireshark on loopback interface; capture normal polling cycles; dissect MBAP Header & PDU structures. |
 | **Day 4** | **Automation with `pymodbus`** | Build a secure Python client for state polling, input validation, and telemetry logging; execute controlled write commands. |
@@ -53,13 +53,13 @@ Using Docker guarantees an isolated sandbox without polluting your host system l
 # Pull and start the official OpenPLC v3 container
 docker run -d \
   --name openplc-sandbox \
-  -p 8080:8080 \
+  -p 8081:8080 \
   -p 502:502 \
   --restart unless-stopped \
-  thiagoralves/openplc:v3
+  fdamador/openplc:latest
 ```
 
-- **Web Dashboard:** Navigate to `http://localhost:8080`
+- **Web Dashboard:** Navigate to `http://localhost:8081` (host port 8081 avoids the common 8080 collision)
 - **Default Credentials:** Username: `openplc` | Password: `openplc`
 - **Immediate Task:** Change default administrative password in **Settings** to align with IEC 62443-4-2 (FR 1 - Identification and Authentication Control).
 
@@ -82,13 +82,13 @@ PROGRAM TankLevelControl
   VAR
     LowLevelSensor AT %IX0.0 : BOOL;      (* Digital Input: Float switch at low limit *)
     HighLevelSensor AT %IX0.1 : BOOL;     (* Digital Input: Float switch at high limit *)
-    EmergencyStop AT %IX0.2 : BOOL;       (* Digital Input: Physical E-Stop contact *)
+    EmergencyStop AT %QX0.4 : BOOL := TRUE; (* NC E-Stop as a writable bit: TRUE = healthy; cleared to simulate a trip *)
     
     PumpMotor AT %QX0.0 : BOOL;           (* Digital Output: Inflow pump *)
     DrainValve AT %QX0.1 : BOOL;          (* Digital Output: Emergency drain valve *)
     AlarmBeacon AT %QX0.2 : BOOL;         (* Digital Output: Critical high alarm *)
 
-    TankLevelRaw AT %IW0 : UINT;          (* Input Register: Scaled 0-1000 (0.0% - 100.0%) *)
+    TankLevelRaw AT %QW2 : UINT;          (* Holding Register 2: Scaled 0-1000, written by the level simulator *)
     HighThreshold AT %QW0 : UINT := 850;  (* Holding Register: Max setpoint (85.0%) *)
     LowThreshold AT %QW1 : UINT := 200;   (* Holding Register: Min setpoint (20.0%) *)
     ManualOverride AT %QX0.3 : BOOL;      (* Digital Output: Remote HMI override *)
@@ -119,8 +119,8 @@ END_PROGRAM
 | :--- | :--- | :--- | :--- | :--- |
 | `%IX0.0` - `%IX0.7` | Discrete Input | FC 02 (Read Discrete Inputs) | `0` - `7` | Digital Sensors (Low/High/E-Stop) |
 | `%QX0.0` - `%QX0.7` | Coil (Discrete Output) | FC 01 (Read), FC 05 (Write Single), FC 15 (Write Multiple) | `0` - `7` | Actuators (Pump, Drain, Alarm) |
-| `%IW0` - `%IW7` | Input Register | FC 04 (Read Input Registers) | `0` - `7` | Analog Inputs (Water Level Sensor) |
-| `%QW0` - `%QW7` | Holding Register | FC 03 (Read), FC 06 (Write Single), FC 16 (Write Multiple) | `0` - `7` | Setpoints (High/Low Thresholds) |
+| `%IW0` - `%IW7` | Input Register | FC 04 (Read Input Registers) | `0` - `7` | Analog Inputs (physical probes; read-only over Modbus, so unused in the simulated lab) |
+| `%QW0` - `%QW7` | Holding Register | FC 03 (Read), FC 06 (Write Single), FC 16 (Write Multiple) | `0` - `7` | Setpoints (`%QW0` High, `%QW1` Low) and simulated level (`%QW2`) |
 
 ---
 
@@ -252,7 +252,7 @@ Modbus TCP is an inherently unauthenticated, unencrypted, cleartext protocol wit
 
 ## 5. Advanced Active Defense: Inline Layer-7 Modbus DPI Proxy
 
-To advance beyond passive detection, the laboratory includes an inline Deep Packet Inspection proxy ([modbus_dpi_proxy.py](file:///Users/mo/Articles/PlcSentinel/modbus_dpi_proxy.py)) listening on port `5020` and protecting OpenPLC on port `502`:
+To advance beyond passive detection, the laboratory includes an inline Deep Packet Inspection proxy ([modbus_dpi_proxy.py](modbus_dpi_proxy.py)) listening on port `5020` and protecting OpenPLC on port `502`:
 
 ```
 +------------------+         +-------------------------------+         +-----------------------+
@@ -266,5 +266,5 @@ To advance beyond passive detection, the laboratory includes an inline Deep Pack
 ### Multi-Tiered Inspection Pipeline:
 1. **Tier 1 (Role Authorization):** Read operations (`FC 01, 02, 03, 04`) are forwarded without latency. Write commands (`FC 05, 06, 15, 16`) from unauthorized IPs are dropped and answered with **Modbus Exception 0x01 (Illegal Function)**.
 2. **Tier 2 (Semantic Boundary Inspection):** Even when a write originates from an authorized Engineering Workstation, the proxy unpacks the register value. If a High Threshold write exceeds safe operating parameters (`value > 900`), the command is rejected with **Modbus Exception 0x03 (Illegal Data Value)** to prevent loss of containment.
-3. **Automated Verification:** Run [test_dpi_firewall.py](file:///Users/mo/Articles/PlcSentinel/test_dpi_firewall.py) to simulate attacks against the proxy and verify that OpenPLC's memory remains safe.
+3. **Automated Verification:** Run [test_dpi_firewall.py](test_dpi_firewall.py) to simulate attacks against the proxy and verify that OpenPLC's memory remains safe.
 
