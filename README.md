@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Standard: IEC 62443](https://img.shields.io/badge/Standard-IEC%2062443-blue.svg)](https://www.isa.org/standards-and-publications/isa-standards/isa-iec-62443-series-of-standards)
-[![Protocols: Modbus | S7comm | OPC UA](https://img.shields.io/badge/Protocols-Modbus%20%7C%20S7comm%20%7C%20OPC%20UA-brightgreen.svg)](#supported-protocols)
+[![Protocols: Modbus | S7comm | OPC UA | IEC 104](https://img.shields.io/badge/Protocols-Modbus%20%7C%20S7comm%20%7C%20OPC%20UA%20%7C%20IEC%20104-brightgreen.svg)](#supported-protocols)
 
 **PlcSentinel** is a production-grade, local, and reproducible Industrial Control Systems (ICS) security laboratory and active defense toolkit. It models realistic industrial processes, dissects unauthenticated legacy protocols, simulates weaponized threat techniques (mapped to **MITRE ATT&CK for ICS**), and deploys inline **Layer-7 Deep Packet Inspection (DPI)** mitigation proxies.
 
@@ -51,6 +51,7 @@
    * Enforces semantic process safety boundaries (e.g. overfill protection thresholds).
    * Policy lives in `modbus_policy.json` / `s7_policy.json` (authorized stations, open function codes, protected registers and their limits), validated at startup; CLI flags override it.
    * Per-source caps on concurrent sessions and requests per second (policy keys `max_sessions_per_source`, `max_requests_per_second`) stop one host exhausting the controller's connection table through the gateway; they apply in both modes and log MITRE T0814 events.
+   * **IEC 60870-5-104 (Port 2404):** inline telecontrol gateway ([iec104_dpi_proxy.py](iec104_dpi_proxy.py)) that restricts control commands (types 45-51, 58-64, 100-107) to the authorized EWS, refuses Reset Process (type 105) for everyone, and bounds set-point commands by object address. This is the protocol behind the 2016 Industroyer grid attack.
    * For protocols without a dedicated gateway yet (EtherNet/IP, Unitronics PCOM, vendor engineering protocols), [tls_conduit.py](tls_conduit.py) is an identity-gated conduit: mutual TLS, certificate allow list, per-source caps and ECS logging, then a byte-for-byte relay. Authentication without inspection, which still removes the controller's exposure.
    * `--monitor` runs either gateway inline in detect-only mode: violations are logged as `detected` and forwarded, so a site can observe before enforcing.
    * Authorization is by **principal**: a source IP on the plain listeners (a compensating control for legacy stations) or, on the mutual-TLS listeners (Modbus/TCP Security on 802, S7 on 10202), the **Common Name of a client certificate** issued by the lab CA. Engineering tools that cannot speak TLS reach the S7 gateway through [ews_tls_tunnel.py](ews_tls_tunnel.py). The controller side stays plain: the conduit terminates the identity.
@@ -146,6 +147,10 @@ PlcSentinel/
 ├── s7_sentinel.py                       # Siemens S7comm assessment & telemetry client
 ├── s7_mock_server.py                    # Local Siemens S7-300/1200 mock controller
 ├── s7_dpi_proxy.py                      # Inline S7comm L7 DPI Gateway (CPU Stop interceptor)
+├── iec104_dpi_proxy.py                  # Inline IEC 60870-5-104 telecontrol DPI Gateway
+├── iec104_mock_server.py                # Minimal IEC 104 mock outstation (RTU)
+├── iec104_policy.json                   # IEC 104 gateway policy: authorized EWS, protected set-points
+├── dpi_stream.py                        # Shared asyncio transport for the stream gateways (S7, IEC 104)
 ├── s7_policy.json                       # S7 gateway policy: authorized EWS, open jobs and UserData
 ├── test_s7_dpi_mitigation.py            # S7 DPI mitigation test suite
 ├── generate_opcua_certs.py              # X.509 RSA PKI certificate generator
