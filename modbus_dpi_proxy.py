@@ -19,6 +19,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any
 
+from dpi_limits import SourceLimiter
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [DPI-GATEWAY] %(message)s",
@@ -58,6 +60,8 @@ POLICY_KEYS = {
     "authorized_ews_ips": list,
     "read_function_codes": list,
     "protected_registers": dict,
+    "max_sessions_per_source": int,
+    "max_requests_per_second": int,
     "enforce": bool,
 }
 
@@ -73,7 +77,7 @@ def load_policy(path: str) -> Dict[str, Any]:
     if not isinstance(policy, dict) or set(policy) - set(POLICY_KEYS):
         raise SystemExit(f"[FATAL] Policy file {path}: expected an object with keys {sorted(POLICY_KEYS)}")
     for key, typ in POLICY_KEYS.items():
-        if key in policy and not isinstance(policy[key], typ):
+        if key in policy and (not isinstance(policy[key], typ) or (typ is int and isinstance(policy[key], bool))):
             raise SystemExit(f"[FATAL] Policy file {path}: {key!r} must be a JSON {typ.__name__}")
     try:
         if "protected_registers" in policy:
@@ -95,7 +99,10 @@ class ModbusDPIProxy:
         read_fcs=READ_FCS,
         protected_registers: Optional[Dict[int, int]] = None,
         log_file: str = "logs/ot_security_events.jsonl",
-        enforce: bool = True
+        enforce: bool = True,
+        max_sessions_per_source: int = 8,
+        max_requests_per_second: int = 200,
+        siem_udp: Optional[Tuple[str, int]] = None
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -108,6 +115,11 @@ class ModbusDPIProxy:
         # Monitor mode: every violation is still inspected and logged, but the
         # frame is forwarded, so a site can observe inline before enforcing.
         self.enforce = enforce
+        self.limiter = SourceLimiter(max_sessions_per_source, max_requests_per_second)
+        # One thread per session: the lock keeps JSONL lines and counters intact.
+        self._lock = threading.Lock()
+        self._siem_udp = siem_udp
+        self._siem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if siem_udp else None
         self.stats = {"inspected": 0, "allowed": 0, "blocked": 0}
 
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -157,11 +169,31 @@ class ModbusDPIProxy:
             }
         }
 
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
+        line = json.dumps(event) + "\n"
+        with self._lock:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(line)
+        if self._siem_sock:
+            try:
+                self._siem_sock.sendto(line.encode("utf-8"), self._siem_udp)
+            except OSError as e:
+                logger.warning(f"SIEM UDP forward to {self._siem_udp} failed: {e}")
+
+    def _count(self, key: str):
+        with self._lock:
+            self.stats[key] += 1
 
     def _deny_action(self) -> str:
         return "blocked" if self.enforce else "detected"
+
+    def _emit_limit_event(self, client_ip: str, client_port: int, reason: str):
+        """Resource caps protect the gateway and controller, so they apply in both modes."""
+        logger.warning(f"[BLOCKED] {reason}")
+        self.emit_siem_event(
+            action="blocked", severity="high", reason=reason, client_ip=client_ip, client_port=client_port,
+            trans_id=0, unit_id=0, fc=0, mitre_technique_id="T0814", mitre_technique_name="Denial of Service",
+            payload_details={"max_sessions": self.limiter.max_sessions, "max_requests_per_second": self.limiter.max_rps}
+        )
 
     def generate_exception_response(self, trans_id: int, unit_id: int, orig_fc: int, exc_code: int) -> bytes:
         mbap = trans_id.to_bytes(2, "big") + b"\x00\x00" + b"\x00\x03" + unit_id.to_bytes(1, "big")
@@ -207,7 +239,7 @@ class ModbusDPIProxy:
         return None
 
     def inspect_request(self, raw_pkt: bytes, client_ip: str, client_port: int) -> Tuple[bool, Optional[bytes], str]:
-        self.stats["inspected"] += 1
+        self._count("inspected")
         if len(raw_pkt) < 8:
             return False, None, "Malformed packet: length shorter than MBAP + FC"
 
@@ -226,7 +258,7 @@ class ModbusDPIProxy:
         # requires the authorized EWS identity.
         # ----------------------------------------------------------------------
         if fc not in self.read_fcs and client_ip not in self.authorized_ews_ips:
-            self.stats["blocked"] += 1
+            self._count("blocked")
             reason = f"POLICY VIOLATION: Non-read Function Code {fc:02d} ({FC_NAMES.get(fc, 'Vendor/Unknown')}) denied from unauthorized IP {client_ip}"
             exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_FUNCTION)
 
@@ -257,7 +289,7 @@ class ModbusDPIProxy:
         hazard = self._check_setpoint_hazard(fc, raw_pkt)
         if hazard is not None:
             reg_addr, reg_val = hazard
-            self.stats["blocked"] += 1
+            self._count("blocked")
             if reg_val is None:
                 reason = (
                     f"CRITICAL PROCESS HAZARD: Masked write to protected setpoint register {reg_addr} refused; "
@@ -286,7 +318,7 @@ class ModbusDPIProxy:
             return False, exc_resp, reason
 
         # Allowed Operation
-        self.stats["allowed"] += 1
+        self._count("allowed")
         addr = int.from_bytes(raw_pkt[8:10], "big") if len(raw_pkt) >= 10 else 0
         qty = int.from_bytes(raw_pkt[10:12], "big") if len(raw_pkt) >= 12 else 0
         self.emit_siem_event(
@@ -303,6 +335,18 @@ class ModbusDPIProxy:
         return True, None, "ALLOW"
 
     def handle_client_session(self, client_sock: socket.socket, client_addr: Tuple[str, int]):
+        client_ip, client_port = client_addr
+        if not self.limiter.open_session(client_ip):
+            self._emit_limit_event(client_ip, client_port,
+                                   f"Session cap: {self.limiter.max_sessions} sessions already open from {client_ip}; refusing another")
+            client_sock.close()
+            return
+        try:
+            self._serve_session(client_sock, client_addr)
+        finally:
+            self.limiter.close_session(client_ip)
+
+    def _serve_session(self, client_sock: socket.socket, client_addr: Tuple[str, int]):
         client_ip, client_port = client_addr
         try:
             backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -370,6 +414,10 @@ class ModbusDPIProxy:
             if len(buf) < total:
                 break  # wait for the remainder of this ADU
             adu, buf = buf[:total], buf[total:]
+            if not self.limiter.allow_request(client_ip):
+                self._emit_limit_event(client_ip, client_port,
+                                       f"Request rate cap: over {self.limiter.max_rps} requests/s from {client_ip}; dropping session")
+                return None
             is_allowed, synthetic_resp, reason = self.inspect_request(adu, client_ip, client_port)
             if is_allowed:
                 backend_sock.sendall(adu)
@@ -417,9 +465,14 @@ if __name__ == "__main__":
     parser.add_argument("--authorized-ip", action="append", default=None, help="Authorized EWS IP; repeatable (default: 192.168.1.50)")
     parser.add_argument("--log-file", type=str, default="logs/ot_security_events.jsonl", help="SIEM event log path")
     parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
+    parser.add_argument("--siem-udp", type=str, metavar="HOST:PORT", help="Also send every event as a JSON datagram to this collector (Elastic/Logstash/Wazuh)")
     args = parser.parse_args()
 
     policy = load_policy(args.policy) if args.policy else {}
+    siem_udp = None
+    if args.siem_udp:
+        host, _, port = args.siem_udp.rpartition(":")
+        siem_udp = (host, int(port))
     proxy = ModbusDPIProxy(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
@@ -429,6 +482,9 @@ if __name__ == "__main__":
         read_fcs=policy.get("read_function_codes", READ_FCS),
         protected_registers=policy.get("protected_registers"),
         log_file=args.log_file,
-        enforce=policy.get("enforce", True) and not args.monitor
+        enforce=policy.get("enforce", True) and not args.monitor,
+        max_sessions_per_source=policy.get("max_sessions_per_source", 8),
+        max_requests_per_second=policy.get("max_requests_per_second", 200),
+        siem_udp=siem_udp
     )
     proxy.start_proxy()
