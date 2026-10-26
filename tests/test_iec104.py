@@ -11,8 +11,8 @@ import struct
 import tempfile
 import unittest
 
-import iec104_dpi_proxy
-from iec104_dpi_proxy import IEC104DPIProxy, IEC104Parser
+from plcsentinel.gateways import iec104_dpi_proxy
+from plcsentinel.gateways.iec104_dpi_proxy import IEC104DPIProxy, IEC104Parser
 
 EWS = "192.168.1.50"
 ATTACKER = "10.0.0.9"
@@ -99,7 +99,7 @@ class IEC104PolicyTests(unittest.TestCase):
             self.assertEqual(json.loads(f.readline())["event"]["action"], "detected")
 
     def test_shipped_policy_file_matches_defaults(self):
-        pol = iec104_dpi_proxy.load_policy("iec104_policy.json")
+        pol = iec104_dpi_proxy.load_policy("config/iec104_policy.json")
         self.assertEqual(pol["authorized_ews_identities"], ["ews-01"])
         self.assertEqual(pol["protected_setpoints"], [{"ca": 1, "ioa": 100, "min": 0.0, "max": 900.0}])
         with self.assertRaises(SystemExit):

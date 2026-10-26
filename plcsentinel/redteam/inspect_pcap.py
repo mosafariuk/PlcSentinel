@@ -22,7 +22,7 @@ FC_NAMES = {
     16: "Write Multiple Registers",
 }
 
-def dissect_pcap(pcap_path="modbus_lab_traffic.pcap"):
+def dissect_pcap(pcap_path="data/modbus_lab_traffic.pcap"):
     print(f"[*] Reading PCAP capture: {pcap_path} ...\n")
     packets = rdpcap(pcap_path)
     print(f"Total Packets: {len(packets)}")
