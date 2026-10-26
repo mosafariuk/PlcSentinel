@@ -8,7 +8,7 @@ PY    := $(VENV)/bin/python3
 PIP   := $(VENV)/bin/pip
 COMPOSE ?= $(shell if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; else echo "docker compose"; fi)
 
-.PHONY: help setup venv clean test-all test-unit test-modbus test-s7 test-opcua test-ews test-identity \
+.PHONY: help setup venv clean test-all test-unit test-modbus test-s7 test-opcua test-ews test-identity test-iec104 \
         run-modbus-lab run-s7-lab run-opcua-lab soc read-modbus read-s7 \
         docker-up docker-down docker-logs
 
@@ -41,6 +41,11 @@ run-s7-lab: ## Start local S7 mock controller and S7comm L7 DPI proxy
 	@sleep 1
 	@$(PY) s7_dpi_proxy.py --listen-port 10200 --backend-port 1102 --policy s7_policy.json &
 
+run-iec104-lab: ## Start the IEC 104 mock outstation and telecontrol DPI gateway
+	@$(PY) iec104_mock_server.py --port 24040 &
+	@sleep 1
+	@$(PY) iec104_dpi_proxy.py --listen-port 2404 --backend-port 24040 --policy iec104_policy.json &
+
 run-opcua-lab: ## Generate X.509 PKI certificates and launch encrypted OPC UA server
 	@$(PY) generate_opcua_certs.py
 	@$(PY) opcua_secure_server.py &
@@ -64,7 +69,7 @@ hmi: ## Run terminal-based supervisory HMI console
 # AUTOMATED THREAT MITIGATION TESTS
 # ------------------------------------------------------------------------------
 test-unit: ## Run offline DPI policy unit tests (no PLC, proxies or venv extras needed)
-	@$(PY) -m unittest -v test_dpi_policy test_dpi_identity
+	@$(PY) -m unittest -v test_dpi_policy test_dpi_identity test_iec104
 
 test-modbus: ## Execute automated Modbus DPI threat mitigation tests
 	@$(PY) test_dpi_firewall.py
@@ -83,7 +88,10 @@ test-ews: ## Prove the authorized-EWS write path through both gateways (needs ma
 test-identity: ## Prove certificate identity authorizes writes from an untrusted address (needs make docker-up)
 	@$(PY) test_identity_live.py
 
-test-all: test-unit test-modbus test-s7 test-opcua test-ews test-identity ## Run offline unit tests, the protocol suites, the authorized-EWS path, then the certificate-identity path
+test-iec104: ## Prove IEC 104 control commands are blocked at the conduit (needs make docker-up)
+	@$(PY) test_iec104_live.py
+
+test-all: test-unit test-modbus test-s7 test-opcua test-ews test-identity test-iec104 ## Run offline unit tests, the protocol suites, the authorized-EWS and certificate-identity paths, then IEC 104
 	@echo "======================================================================"
 	@echo "       ALL INDUSTRIAL THREAT MITIGATION TESTS PASSED SUCCESSFULLY!    "
 	@echo "======================================================================"
