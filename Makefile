@@ -34,12 +34,12 @@ venv:
 # ------------------------------------------------------------------------------
 run-modbus-lab: ## Start OpenPLC Docker container and inline Modbus L7 DPI proxy
 	@docker run -d --name openplc-sandbox -p 8081:8080 -p 502:502 fdamador/openplc:latest 2>/dev/null || true
-	@$(PY) modbus_dpi_proxy.py --listen-port 5020 --backend-port 502 --authorized-ip 192.168.1.50 &
+	@$(PY) modbus_dpi_proxy.py --listen-port 5020 --backend-port 502 --policy modbus_policy.json &
 
 run-s7-lab: ## Start local S7 mock controller and S7comm L7 DPI proxy
 	@$(PY) s7_mock_server.py &
 	@sleep 1
-	@$(PY) s7_dpi_proxy.py --listen-port 10200 --backend-port 1102 --authorized-ews 192.168.1.50 &
+	@$(PY) s7_dpi_proxy.py --listen-port 10200 --backend-port 1102 --policy s7_policy.json &
 
 run-opcua-lab: ## Generate X.509 PKI certificates and launch encrypted OPC UA server
 	@$(PY) generate_opcua_certs.py

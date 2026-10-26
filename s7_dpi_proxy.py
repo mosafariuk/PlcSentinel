@@ -76,6 +76,37 @@ OPEN_FCS = frozenset({S7_FC_READ_VAR, S7_FC_SETUP_COMM})
 # group 4 "CPU functions", subfunction 1 "Read SZL" (status / identification).
 OPEN_USERDATA = frozenset({(4, 1)})
 
+# JSON policy file keys and their types; CLI flags override file values.
+POLICY_KEYS = {
+    "authorized_ews_ips": list,
+    "open_functions": list,
+    "open_userdata": list,
+    "enforce": bool,
+}
+
+
+def load_policy(path: str) -> Dict[str, Any]:
+    """Read and validate a JSON policy file. Any problem is fatal at startup:
+    a gateway must never run on a policy it only half understood."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            policy = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"[FATAL] Cannot read policy file {path}: {e}")
+    if not isinstance(policy, dict) or set(policy) - set(POLICY_KEYS):
+        raise SystemExit(f"[FATAL] Policy file {path}: expected an object with keys {sorted(POLICY_KEYS)}")
+    for key, typ in POLICY_KEYS.items():
+        if key in policy and not isinstance(policy[key], typ):
+            raise SystemExit(f"[FATAL] Policy file {path}: {key!r} must be a JSON {typ.__name__}")
+    try:
+        if "open_functions" in policy:
+            policy["open_functions"] = [int(v) for v in policy["open_functions"]]
+        if "open_userdata" in policy:
+            policy["open_userdata"] = {(int(g), int(s)) for g, s in policy["open_userdata"]}
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"[FATAL] Policy file {path}: open_functions must be integers and open_userdata [group, subfunction] pairs ({e})")
+    return policy
+
 # S7 Memory Area Codes
 S7_AREA_NAMES = {
     0x81: "Process Inputs (%I / PE)",
@@ -198,7 +229,9 @@ class S7DPIProxy:
         listen_port: int = 10200,
         backend_host: str = "127.0.0.1",
         backend_port: int = 102,
-        authorized_ews_ip: str = "192.168.1.50",
+        authorized_ews_ips=("192.168.1.50",),
+        open_fcs=OPEN_FCS,
+        open_userdata=OPEN_USERDATA,
         log_file: str = "logs/s7_security_events.jsonl",
         enforce: bool = True
     ):
@@ -206,7 +239,9 @@ class S7DPIProxy:
         self.listen_port = listen_port
         self.backend_host = backend_host
         self.backend_port = backend_port
-        self.authorized_ews_ip = authorized_ews_ip
+        self.authorized_ews_ips = frozenset(authorized_ews_ips)
+        self.open_fcs = frozenset(open_fcs)
+        self.open_userdata = frozenset(tuple(x) for x in open_userdata)
         self.log_file = log_file
         # Monitor mode: violations are inspected and logged but forwarded.
         self.enforce = enforce
@@ -284,7 +319,7 @@ class S7DPIProxy:
             return False, reason
 
         # The authorized Engineering Workstation may issue anything but CPU Stop.
-        if client_ip == self.authorized_ews_ip:
+        if client_ip in self.authorized_ews_ips:
             self.stats["allowed"] += 1
             return True, "ALLOW"
 
@@ -338,7 +373,7 @@ class S7DPIProxy:
         # Only Read Var, Setup Communication and SZL status reads are open to
         # non-EWS hosts; unknown Job functions and other UserData are denied.
         # ----------------------------------------------------------------------
-        if fc in OPEN_FCS or parsed.get("userdata") in OPEN_USERDATA:
+        if fc in self.open_fcs or parsed.get("userdata") in self.open_userdata:
             self.stats["allowed"] += 1
             return True, "ALLOW"
 
@@ -473,7 +508,8 @@ class S7DPIProxy:
         logger.info("=" * 72)
         logger.info(f"S7comm Layer-7 DPI Proxy ACTIVE on {self.listen_host}:{self.listen_port}")
         logger.info(f"Forwarding sanitized traffic to Siemens PLC at {self.backend_host}:{self.backend_port}")
-        logger.info(f"Authorized Engineering Station IP : {self.authorized_ews_ip}")
+        logger.info(f"Authorized Engineering Stations   : {sorted(self.authorized_ews_ips)}")
+        logger.info(f"Open to every host                : jobs {sorted(f'0x{x:02X}' for x in self.open_fcs)}, userdata {sorted(self.open_userdata)}")
         logger.info(f"SIEM Structured Logging           : {os.path.abspath(self.log_file)}")
         logger.info(f"Mode                              : {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
         logger.info("=" * 72)
@@ -488,19 +524,23 @@ if __name__ == "__main__":
     parser.add_argument("--listen-port", type=int, default=10200, help="DPI Proxy listen port (default: 10200)")
     parser.add_argument("--backend-host", type=str, default="127.0.0.1", help="Backend PLC IP (default: 127.0.0.1)")
     parser.add_argument("--backend-port", type=int, default=1102, help="Backend PLC port (default: 1102 or 102)")
-    parser.add_argument("--authorized-ews", type=str, default="192.168.1.50", help="Authorized EWS IP (default: 192.168.1.50)")
+    parser.add_argument("--policy", type=str, help="JSON policy file (see s7_policy.json); explicit CLI flags override it")
+    parser.add_argument("--authorized-ews", action="append", default=None, help="Authorized EWS IP; repeatable (default: 192.168.1.50)")
     parser.add_argument("--log-file", type=str, default="logs/s7_security_events.jsonl", help="SIEM event output path")
     parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
     args = parser.parse_args()
 
+    policy = load_policy(args.policy) if args.policy else {}
     proxy = S7DPIProxy(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
         backend_host=args.backend_host,
         backend_port=args.backend_port,
-        authorized_ews_ip=args.authorized_ews,
+        authorized_ews_ips=args.authorized_ews or policy.get("authorized_ews_ips", ["192.168.1.50"]),
+        open_fcs=policy.get("open_functions", OPEN_FCS),
+        open_userdata=policy.get("open_userdata", OPEN_USERDATA),
         log_file=args.log_file,
-        enforce=not args.monitor
+        enforce=policy.get("enforce", True) and not args.monitor
     )
     try:
         asyncio.run(proxy.start())

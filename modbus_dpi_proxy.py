@@ -49,9 +49,40 @@ FC_NAMES = {
 # writes, FC08 diagnostics and vendor codes all require the EWS identity.
 READ_FCS = frozenset({1, 2, 3, 4})
 
-# Holding registers 0 (High) and 1 (Low) are the tank setpoints, both scaled
-# 0..1000; neither may be pushed above the safe capacity threshold.
-PROTECTED_SETPOINT_REGS = (0, 1)
+# Protected holding registers -> maximum safe value. Registers 0 (High) and
+# 1 (Low) are the tank setpoints, scaled 0..1000.
+PROTECTED_SETPOINT_REGS = {0: 900, 1: 900}
+
+# JSON policy file keys and their types; CLI flags override file values.
+POLICY_KEYS = {
+    "authorized_ews_ips": list,
+    "read_function_codes": list,
+    "protected_registers": dict,
+    "enforce": bool,
+}
+
+
+def load_policy(path: str) -> Dict[str, Any]:
+    """Read and validate a JSON policy file. Any problem is fatal at startup:
+    a gateway must never run on a policy it only half understood."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            policy = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"[FATAL] Cannot read policy file {path}: {e}")
+    if not isinstance(policy, dict) or set(policy) - set(POLICY_KEYS):
+        raise SystemExit(f"[FATAL] Policy file {path}: expected an object with keys {sorted(POLICY_KEYS)}")
+    for key, typ in POLICY_KEYS.items():
+        if key in policy and not isinstance(policy[key], typ):
+            raise SystemExit(f"[FATAL] Policy file {path}: {key!r} must be a JSON {typ.__name__}")
+    try:
+        if "protected_registers" in policy:
+            policy["protected_registers"] = {int(k): int(v) for k, v in policy["protected_registers"].items()}
+        if "read_function_codes" in policy:
+            policy["read_function_codes"] = [int(v) for v in policy["read_function_codes"]]
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"[FATAL] Policy file {path}: register addresses, limits and function codes must be integers ({e})")
+    return policy
 
 class ModbusDPIProxy:
     def __init__(
@@ -60,8 +91,9 @@ class ModbusDPIProxy:
         listen_port: int = 5020,
         backend_host: str = "127.0.0.1",
         backend_port: int = 502,
-        authorized_ews_ip: str = "192.168.1.50",
-        max_safe_high_threshold: int = 900,
+        authorized_ews_ips=("192.168.1.50",),
+        read_fcs=READ_FCS,
+        protected_registers: Optional[Dict[int, int]] = None,
         log_file: str = "logs/ot_security_events.jsonl",
         enforce: bool = True
     ):
@@ -69,8 +101,9 @@ class ModbusDPIProxy:
         self.listen_port = listen_port
         self.backend_host = backend_host
         self.backend_port = backend_port
-        self.authorized_ews_ip = authorized_ews_ip
-        self.max_safe_high_threshold = max_safe_high_threshold
+        self.authorized_ews_ips = frozenset(authorized_ews_ips)
+        self.read_fcs = frozenset(read_fcs)
+        self.protected_registers = dict(PROTECTED_SETPOINT_REGS if protected_registers is None else protected_registers)
         self.log_file = log_file
         # Monitor mode: every violation is still inspected and logged, but the
         # frame is forwarded, so a site can observe inline before enforcing.
@@ -165,10 +198,11 @@ class ModbusDPIProxy:
         """
         if fc == 22 and len(raw_pkt) >= 10:
             reg = int.from_bytes(raw_pkt[8:10], "big")
-            if reg in PROTECTED_SETPOINT_REGS:
+            if reg in self.protected_registers:
                 return reg, None
         for reg, val in self._written_registers(fc, raw_pkt):
-            if reg in PROTECTED_SETPOINT_REGS and val > self.max_safe_high_threshold:
+            limit = self.protected_registers.get(reg)
+            if limit is not None and val > limit:
                 return reg, val
         return None
 
@@ -191,7 +225,7 @@ class ModbusDPIProxy:
         # Read allowlist: only FC 01-04 are open to every host. Everything else
         # requires the authorized EWS identity.
         # ----------------------------------------------------------------------
-        if fc not in READ_FCS and client_ip != self.authorized_ews_ip:
+        if fc not in self.read_fcs and client_ip not in self.authorized_ews_ips:
             self.stats["blocked"] += 1
             reason = f"POLICY VIOLATION: Non-read Function Code {fc:02d} ({FC_NAMES.get(fc, 'Vendor/Unknown')}) denied from unauthorized IP {client_ip}"
             exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_FUNCTION)
@@ -232,7 +266,7 @@ class ModbusDPIProxy:
             else:
                 reason = (
                     f"CRITICAL PROCESS HAZARD: Setpoint register {reg_addr} = {reg_val} exceeds safe capacity "
-                    f"({self.max_safe_high_threshold}). Potential loss-of-containment attack."
+                    f"({self.protected_registers[reg_addr]}). Potential loss-of-containment attack."
                 )
             exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_DATA_VALUE)
 
@@ -247,7 +281,7 @@ class ModbusDPIProxy:
                 fc=fc,
                 mitre_technique_id="T0836",
                 mitre_technique_name="Modify Parameter",
-                payload_details={"target_register": reg_addr, "attempted_value": reg_val, "safe_limit": self.max_safe_high_threshold}
+                payload_details={"target_register": reg_addr, "attempted_value": reg_val, "safe_limit": self.protected_registers[reg_addr]}
             )
             return False, exc_resp, reason
 
@@ -356,6 +390,7 @@ class ModbusDPIProxy:
         logger.info("=" * 70)
         logger.info(f"Modbus L7 DPI Proxy ACTIVE on {self.listen_host}:{self.listen_port}")
         logger.info(f"SIEM Structured Logging: {os.path.abspath(self.log_file)}")
+        logger.info(f"Authorized EWS: {sorted(self.authorized_ews_ips)} | open FCs: {sorted(self.read_fcs)} | protected registers: {self.protected_registers}")
         logger.info(f"Mode: {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
         logger.info("=" * 70)
 
@@ -378,18 +413,22 @@ if __name__ == "__main__":
     parser.add_argument("--listen-port", type=int, default=5020, help="Listen port (default: 5020)")
     parser.add_argument("--backend-host", type=str, default="127.0.0.1", help="Backend PLC IP (default: 127.0.0.1)")
     parser.add_argument("--backend-port", type=int, default=502, help="Backend PLC port (default: 502)")
-    parser.add_argument("--authorized-ip", type=str, default="192.168.1.50", help="Authorized EWS IP (default: 192.168.1.50)")
+    parser.add_argument("--policy", type=str, help="JSON policy file (see modbus_policy.json); explicit CLI flags override it")
+    parser.add_argument("--authorized-ip", action="append", default=None, help="Authorized EWS IP; repeatable (default: 192.168.1.50)")
     parser.add_argument("--log-file", type=str, default="logs/ot_security_events.jsonl", help="SIEM event log path")
     parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
     args = parser.parse_args()
 
+    policy = load_policy(args.policy) if args.policy else {}
     proxy = ModbusDPIProxy(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
         backend_host=args.backend_host,
         backend_port=args.backend_port,
-        authorized_ews_ip=args.authorized_ip,
+        authorized_ews_ips=args.authorized_ip or policy.get("authorized_ews_ips", ["192.168.1.50"]),
+        read_fcs=policy.get("read_function_codes", READ_FCS),
+        protected_registers=policy.get("protected_registers"),
         log_file=args.log_file,
-        enforce=not args.monitor
+        enforce=policy.get("enforce", True) and not args.monitor
     )
     proxy.start_proxy()

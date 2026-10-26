@@ -17,6 +17,8 @@ import socket
 import tempfile
 import unittest
 
+import modbus_dpi_proxy
+import s7_dpi_proxy
 from modbus_dpi_proxy import ModbusDPIProxy, EXC_ILLEGAL_FUNCTION, EXC_ILLEGAL_DATA_VALUE
 from s7_dpi_proxy import S7DPIProxy, S7PacketParser
 
@@ -49,7 +51,7 @@ def s7any_item(db: int, area: int = 0x84) -> bytes:
 class ModbusPolicyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.proxy = ModbusDPIProxy(authorized_ews_ip=EWS, log_file=os.path.join(self.tmp.name, "m.jsonl"))
+        self.proxy = ModbusDPIProxy(authorized_ews_ips=[EWS], log_file=os.path.join(self.tmp.name, "m.jsonl"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -135,7 +137,7 @@ class ModbusPolicyTests(unittest.TestCase):
 
     def test_monitor_mode_forwards_and_logs_detected(self):
         log = os.path.join(self.tmp.name, "mon.jsonl")
-        proxy = ModbusDPIProxy(authorized_ews_ip=EWS, log_file=log, enforce=False)
+        proxy = ModbusDPIProxy(authorized_ews_ips=[EWS], log_file=log, enforce=False)
         client, client_peer = socket.socketpair()
         backend, backend_peer = socket.socketpair()
         try:
@@ -153,10 +155,41 @@ class ModbusPolicyTests(unittest.TestCase):
             self.assertEqual(json.loads(f.readline())["event"]["action"], "detected")
 
 
+    def write_policy(self, obj):
+        path = os.path.join(self.tmp.name, "policy.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        return path
+
+    def test_policy_file_overrides_defaults(self):
+        pol = modbus_dpi_proxy.load_policy(self.write_policy({
+            "authorized_ews_ips": [ATTACKER], "read_function_codes": [3], "protected_registers": {"5": 100}}))
+        proxy = ModbusDPIProxy(authorized_ews_ips=pol["authorized_ews_ips"], read_fcs=pol["read_function_codes"],
+                               protected_registers=pol["protected_registers"], log_file=os.path.join(self.tmp.name, "p.jsonl"))
+        self.assertFalse(proxy.inspect_request(adu("0001 0000 0006 01 06 0005 00C8"), ATTACKER, 1)[0])   # reg5=200 > 100
+        self.assertTrue(proxy.inspect_request(adu("0002 0000 0006 01 06 0000 270F"), ATTACKER, 1)[0])    # reg0 no longer protected
+        self.assertFalse(proxy.inspect_request(adu("0003 0000 0006 01 01 0000 0004"), EWS, 1)[0])        # FC1 not open, EWS not authorized
+        self.assertTrue(proxy.inspect_request(adu("0004 0000 0006 01 03 0000 0002"), EWS, 1)[0])
+
+    def test_policy_file_rejects_bad_input(self):
+        for bad in ({"unknown": 1}, {"enforce": "yes"}, {"protected_registers": {"x": 1}}, [1, 2]):
+            with self.assertRaises(SystemExit, msg=repr(bad)):
+                modbus_dpi_proxy.load_policy(self.write_policy(bad))
+        with self.assertRaises(SystemExit):
+            modbus_dpi_proxy.load_policy(os.path.join(self.tmp.name, "missing.json"))
+
+    def test_shipped_policy_file_matches_defaults(self):
+        pol = modbus_dpi_proxy.load_policy("modbus_policy.json")
+        self.assertEqual(frozenset(pol["read_function_codes"]), modbus_dpi_proxy.READ_FCS)
+        self.assertEqual(pol["protected_registers"], modbus_dpi_proxy.PROTECTED_SETPOINT_REGS)
+        self.assertEqual(pol["authorized_ews_ips"], ["192.168.1.50"])
+        self.assertTrue(pol["enforce"])
+
+
 class S7PolicyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.proxy = S7DPIProxy(authorized_ews_ip=EWS, log_file=os.path.join(self.tmp.name, "s.jsonl"))
+        self.proxy = S7DPIProxy(authorized_ews_ips=[EWS], log_file=os.path.join(self.tmp.name, "s.jsonl"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -208,12 +241,32 @@ class S7PolicyTests(unittest.TestCase):
 
     def test_monitor_mode_forwards_violations(self):
         log = os.path.join(self.tmp.name, "mon.jsonl")
-        proxy = S7DPIProxy(authorized_ews_ip=EWS, log_file=log, enforce=False)
+        proxy = S7DPIProxy(authorized_ews_ips=[EWS], log_file=log, enforce=False)
         stop = s7_job(b"\x29\x00\x00\x00\x00")
         out, rest, reason = proxy._frame_client_stream(stop, ATTACKER, 1)
         self.assertEqual((out, rest, reason), (stop, b"", None))
         with open(log, encoding="utf-8") as f:
             self.assertEqual(json.loads(f.readline())["event"]["action"], "detected")
+
+    def test_policy_file_overrides_defaults(self):
+        path = os.path.join(self.tmp.name, "policy.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"authorized_ews_ips": [], "open_functions": [], "open_userdata": [[5, 1]]}, f)
+        pol = s7_dpi_proxy.load_policy(path)
+        proxy = S7DPIProxy(authorized_ews_ips=pol["authorized_ews_ips"], open_fcs=pol["open_functions"],
+                           open_userdata=pol["open_userdata"], log_file=os.path.join(self.tmp.name, "p.jsonl"))
+        read = S7PacketParser.dissect(s7_job(b"\x04\x01" + s7any_item(1)))
+        security = S7PacketParser.dissect(s7_userdata(b"\x00\x01\x12\x04\x11\x45\x01\x00"))
+        self.assertFalse(proxy.evaluate_policy(read, EWS, 1)[0])        # nobody is authorized, Read Var no longer open
+        self.assertTrue(proxy.evaluate_policy(security, ATTACKER, 1)[0])  # group 5 opened by the file
+
+    def test_shipped_policy_file_matches_defaults(self):
+        pol = s7_dpi_proxy.load_policy("s7_policy.json")
+        self.assertEqual(frozenset(pol["open_functions"]), s7_dpi_proxy.OPEN_FCS)
+        self.assertEqual(frozenset(pol["open_userdata"]), s7_dpi_proxy.OPEN_USERDATA)
+        self.assertEqual(pol["authorized_ews_ips"], ["192.168.1.50"])
+        with self.assertRaises(SystemExit):
+            s7_dpi_proxy.load_policy(self.tmp.name)  # a directory, not a file
 
     def test_cotp_connect_passes_through(self):
         cr = b"\x03\x00\x00\x16\x11\xe0\x00\x00\x00\x01\x00\xc0\x01\x0a\xc1\x02\x01\x00\xc2\x02\x01\x02"

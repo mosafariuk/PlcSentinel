@@ -49,6 +49,7 @@
    * Only read operations are open to every host. Writes, masked and combined writes, diagnostics, vendor codes, logic transfers and S7 UserData requests (other than status reads) require the authorized engineering-workstation identity.
    * Synthesizes RFC-compliant Modbus Exceptions (`0x01` Illegal Function, `0x03` Illegal Data Value).
    * Enforces semantic process safety boundaries (e.g. overfill protection thresholds).
+   * Policy lives in `modbus_policy.json` / `s7_policy.json` (authorized stations, open function codes, protected registers and their limits), validated at startup; CLI flags override it.
    * `--monitor` runs either gateway inline in detect-only mode: violations are logged as `detected` and forwarded, so a site can observe before enforcing.
    * Note: the Modbus/S7 conduits authorize by **source IP** — a compensating control for unauthenticated legacy protocols, not a cryptographic identity. OPC UA is the mutually-authenticated path.
 3. **Unified OT SOC Threat Dashboard:**
@@ -80,7 +81,7 @@ pip install pymodbus scapy asyncua cryptography requests python-snap7
 docker run -d --name openplc-sandbox -p 8081:8080 -p 502:502 fdamador/openplc:latest
 
 # Start Modbus L7 DPI Proxy
-python3 modbus_dpi_proxy.py --listen-port 5020 --backend-port 502 --authorized-ip 192.168.1.50 &
+python3 modbus_dpi_proxy.py --listen-port 5020 --backend-port 502 --policy modbus_policy.json &
 
 # Read live telemetry safely through the proxy
 python3 read_via_proxy.py
@@ -92,7 +93,7 @@ python3 read_via_proxy.py
 python3 s7_mock_server.py &
 
 # Start S7comm Layer-7 DPI Proxy
-python3 s7_dpi_proxy.py --listen-port 10200 --backend-port 1102 &
+python3 s7_dpi_proxy.py --listen-port 10200 --backend-port 1102 --policy s7_policy.json &
 
 # Run automated S7 active mitigation test
 python3 test_s7_dpi_mitigation.py
@@ -127,6 +128,7 @@ PlcSentinel/
 ├── wireshark_filters.txt                # Curated Wireshark filters & color rules
 ├── tank_control.st                      # IEC 61131-3 Structured Text logic
 ├── modbus_dpi_proxy.py                  # Inline Modbus L7 DPI Gateway with ECS logging
+├── modbus_policy.json                   # Modbus gateway policy: authorized EWS, open FCs, protected registers
 ├── read_via_proxy.py                    # Telemetry reader via Modbus DPI proxy
 ├── test_dpi_firewall.py                 # Automated Modbus mitigation test suite
 ├── test_dpi_policy.py                   # Offline unit tests for both DPI policy engines (no services needed)
@@ -138,6 +140,7 @@ PlcSentinel/
 ├── s7_sentinel.py                       # Siemens S7comm assessment & telemetry client
 ├── s7_mock_server.py                    # Local Siemens S7-300/1200 mock controller
 ├── s7_dpi_proxy.py                      # Inline S7comm L7 DPI Gateway (CPU Stop interceptor)
+├── s7_policy.json                       # S7 gateway policy: authorized EWS, open jobs and UserData
 ├── test_s7_dpi_mitigation.py            # S7 DPI mitigation test suite
 ├── generate_opcua_certs.py              # X.509 RSA PKI certificate generator
 ├── opcua_secure_server.py               # IEC 62541 Secure OPC UA server
