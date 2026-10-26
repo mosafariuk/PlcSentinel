@@ -65,7 +65,7 @@ services:
       --listen-port 5020
       --backend-host 10.0.1.10
       --backend-port 502
-      --authorized-ip 192.168.1.50
+      --policy modbus_policy.json
       --log-file /app/logs/ot_security_events.jsonl
     ports:
       - "5020:5020"  # Sanitized Modbus TCP Gateway
@@ -90,7 +90,7 @@ services:
       --listen-port 10200
       --backend-host 10.0.1.20
       --backend-port 1102
-      --authorized-ews 192.168.1.50
+      --policy s7_policy.json
       --log-file /app/logs/s7_security_events.jsonl
     ports:
       - "10200:10200" # Sanitized Siemens S7comm Gateway
