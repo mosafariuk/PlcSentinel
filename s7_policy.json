@@ -3,6 +3,7 @@
   "authorized_ews_identities": ["ews-01"],
   "open_functions": [4, 240],
   "open_userdata": [[4, 1]],
+  "change_windows": [],
   "max_sessions_per_source": 8,
   "max_requests_per_second": 200,
   "enforce": true
