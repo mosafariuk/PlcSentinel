@@ -24,6 +24,8 @@ import argparse
 from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any
 
+from dpi_limits import SourceLimiter
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [S7-DPI] %(message)s",
@@ -81,6 +83,8 @@ POLICY_KEYS = {
     "authorized_ews_ips": list,
     "open_functions": list,
     "open_userdata": list,
+    "max_sessions_per_source": int,
+    "max_requests_per_second": int,
     "enforce": bool,
 }
 
@@ -96,7 +100,7 @@ def load_policy(path: str) -> Dict[str, Any]:
     if not isinstance(policy, dict) or set(policy) - set(POLICY_KEYS):
         raise SystemExit(f"[FATAL] Policy file {path}: expected an object with keys {sorted(POLICY_KEYS)}")
     for key, typ in POLICY_KEYS.items():
-        if key in policy and not isinstance(policy[key], typ):
+        if key in policy and (not isinstance(policy[key], typ) or (typ is int and isinstance(policy[key], bool))):
             raise SystemExit(f"[FATAL] Policy file {path}: {key!r} must be a JSON {typ.__name__}")
     try:
         if "open_functions" in policy:
@@ -233,7 +237,9 @@ class S7DPIProxy:
         open_fcs=OPEN_FCS,
         open_userdata=OPEN_USERDATA,
         log_file: str = "logs/s7_security_events.jsonl",
-        enforce: bool = True
+        enforce: bool = True,
+        max_sessions_per_source: int = 8,
+        max_requests_per_second: int = 200
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -245,6 +251,7 @@ class S7DPIProxy:
         self.log_file = log_file
         # Monitor mode: violations are inspected and logged but forwarded.
         self.enforce = enforce
+        self.limiter = SourceLimiter(max_sessions_per_source, max_requests_per_second)
 
         self.stats = {"sessions": 0, "packets": 0, "allowed": 0, "blocked": 0}
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -289,6 +296,15 @@ class S7DPIProxy:
 
     def _deny_action(self) -> str:
         return "blocked" if self.enforce else "detected"
+
+    def _emit_limit_event(self, client_ip: str, client_port: int, reason: str):
+        """Resource caps protect the gateway and controller, so they apply in both modes."""
+        logger.warning(f"[BLOCKED] {reason}")
+        self.log_ecs_event(
+            action="blocked", severity="high", reason=reason, client_ip=client_ip, client_port=client_port,
+            mitre_id="T0814", mitre_name="Denial of Service",
+            s7_details={"max_sessions": self.limiter.max_sessions, "max_requests_per_second": self.limiter.max_rps}
+        )
 
     def evaluate_policy(self, parsed: Dict[str, Any], client_ip: str, client_port: int) -> Tuple[bool, str]:
         """
@@ -416,6 +432,10 @@ class S7DPIProxy:
             if len(buf) < tpkt_len:
                 break  # wait for the remainder of this message
             msg, buf = buf[:tpkt_len], buf[tpkt_len:]
+            if not self.limiter.allow_request(client_ip):
+                self._emit_limit_event(client_ip, client_port,
+                                       f"Request rate cap: over {self.limiter.max_rps} frames/s from {client_ip}; dropping session")
+                return out, buf, "Request rate cap exceeded"
 
             parsed = S7PacketParser.dissect(msg)
             if parsed is None:
@@ -475,7 +495,18 @@ class S7DPIProxy:
         client_addr = client_writer.get_extra_info("peername")
         client_ip, client_port = client_addr[0], client_addr[1]
         logger.info(f"[+] Incoming S7 session accepted from {client_ip}:{client_port}")
+        if not self.limiter.open_session(client_ip):
+            self._emit_limit_event(client_ip, client_port,
+                                   f"Session cap: {self.limiter.max_sessions} sessions already open from {client_ip}; refusing another")
+            client_writer.close()
+            await client_writer.wait_closed()
+            return
+        try:
+            await self._serve_session(client_reader, client_writer, client_ip, client_port)
+        finally:
+            self.limiter.close_session(client_ip)
 
+    async def _serve_session(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, client_ip: str, client_port: int):
         # Connect to backend Siemens PLC
         try:
             plc_reader, plc_writer = await asyncio.wait_for(
@@ -540,7 +571,9 @@ if __name__ == "__main__":
         open_fcs=policy.get("open_functions", OPEN_FCS),
         open_userdata=policy.get("open_userdata", OPEN_USERDATA),
         log_file=args.log_file,
-        enforce=policy.get("enforce", True) and not args.monitor
+        enforce=policy.get("enforce", True) and not args.monitor,
+        max_sessions_per_source=policy.get("max_sessions_per_source", 8),
+        max_requests_per_second=policy.get("max_requests_per_second", 200)
     )
     try:
         asyncio.run(proxy.start())

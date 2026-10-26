@@ -178,12 +178,49 @@ class ModbusPolicyTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             modbus_dpi_proxy.load_policy(os.path.join(self.tmp.name, "missing.json"))
 
+    def last_event(self, log):
+        with open(log, encoding="utf-8") as f:
+            return json.loads(f.readlines()[-1])
+
+    def test_request_rate_cap_drops_session(self):
+        log = os.path.join(self.tmp.name, "rate.jsonl")
+        proxy = ModbusDPIProxy(authorized_ews_ips=[EWS], log_file=log, max_requests_per_second=3)
+        client, client_peer = socket.socketpair()
+        backend, backend_peer = socket.socketpair()
+        try:
+            read = adu("0001 0000 0006 01 03 0000 0002")
+            self.assertIsNone(proxy._process_client_stream(read * 4, client_peer, backend_peer, ATTACKER, 1))
+            backend.settimeout(1)
+            self.assertEqual(backend.recv(4096), read * 3)      # budget of 3 forwarded, 4th tore the session down
+        finally:
+            for s in (client, client_peer, backend, backend_peer):
+                s.close()
+        self.assertEqual(self.last_event(log)["rule"]["mitre"]["id"], "T0814")
+
+    def test_session_cap_refuses_extra_connections(self):
+        log = os.path.join(self.tmp.name, "cap.jsonl")
+        proxy = ModbusDPIProxy(authorized_ews_ips=[EWS], log_file=log, max_sessions_per_source=1)
+        self.assertTrue(proxy.limiter.open_session(ATTACKER))     # the one allowed session
+        ours, peer = socket.socketpair()
+        try:
+            proxy.handle_client_session(peer, (ATTACKER, 2))      # refused before any backend connect
+            ours.settimeout(1)
+            self.assertEqual(ours.recv(16), b"")
+        finally:
+            ours.close()
+        self.assertEqual(self.last_event(log)["rule"]["mitre"]["id"], "T0814")
+        proxy.limiter.close_session(ATTACKER)
+        self.assertTrue(proxy.limiter.open_session(ATTACKER))
+
     def test_shipped_policy_file_matches_defaults(self):
         pol = modbus_dpi_proxy.load_policy("modbus_policy.json")
         self.assertEqual(frozenset(pol["read_function_codes"]), modbus_dpi_proxy.READ_FCS)
         self.assertEqual(pol["protected_registers"], modbus_dpi_proxy.PROTECTED_SETPOINT_REGS)
         self.assertEqual(pol["authorized_ews_ips"], ["192.168.1.50"])
         self.assertTrue(pol["enforce"])
+        self.assertEqual((pol["max_sessions_per_source"], pol["max_requests_per_second"]), (8, 200))
+        with self.assertRaises(SystemExit):
+            modbus_dpi_proxy.load_policy(self.write_policy({"max_sessions_per_source": True}))
 
 
 class S7PolicyTests(unittest.TestCase):
@@ -259,6 +296,22 @@ class S7PolicyTests(unittest.TestCase):
         security = S7PacketParser.dissect(s7_userdata(b"\x00\x01\x12\x04\x11\x45\x01\x00"))
         self.assertFalse(proxy.evaluate_policy(read, EWS, 1)[0])        # nobody is authorized, Read Var no longer open
         self.assertTrue(proxy.evaluate_policy(security, ATTACKER, 1)[0])  # group 5 opened by the file
+
+    def test_request_rate_cap_drops_session(self):
+        log = os.path.join(self.tmp.name, "rate.jsonl")
+        proxy = S7DPIProxy(authorized_ews_ips=[EWS], log_file=log, max_requests_per_second=2)
+        read = s7_job(b"\x04\x01" + s7any_item(1))
+        out, rest, reason = proxy._frame_client_stream(read * 3, ATTACKER, 1)
+        self.assertEqual((out, rest), (read * 2, b""))
+        self.assertIn("rate cap", reason)
+        with open(log, encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readlines()[-1])["rule"]["mitre"]["id"], "T0814")
+
+    def test_session_cap(self):
+        proxy = S7DPIProxy(authorized_ews_ips=[EWS], log_file=os.path.join(self.tmp.name, "cap.jsonl"), max_sessions_per_source=2)
+        self.assertEqual([proxy.limiter.open_session(ATTACKER) for _ in range(3)], [True, True, False])
+        proxy.limiter.close_session(ATTACKER)
+        self.assertTrue(proxy.limiter.open_session(ATTACKER))
 
     def test_shipped_policy_file_matches_defaults(self):
         pol = s7_dpi_proxy.load_policy("s7_policy.json")
