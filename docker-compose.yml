@@ -55,6 +55,22 @@ services:
       ot-control-net:
         ipv4_address: 10.0.1.20
 
+  iec104-mock-server:
+    build: .
+    container_name: plcsentinel-iec104-rtu
+    <<: *hardened
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 24040), timeout=2).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    command: python3 iec104_mock_server.py --bind 0.0.0.0 --port 24040
+    # IEC 104 (24040) is not published to the host: reachable only from the gateway.
+    networks:
+      ot-control-net:
+        ipv4_address: 10.0.1.30
+
   opcua-secure-server:
     build: .
     container_name: plcsentinel-opcua-server
@@ -192,6 +208,41 @@ services:
   # LEVEL 2 / SOC: UNIFIED OT SOC THREAT DASHBOARD
   # ============================================================================
 
+  iec104-dpi-proxy:
+    build: .
+    container_name: plcsentinel-iec104-dpi
+    <<: *hardened
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 2404), timeout=2).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    command: >
+      python3 iec104_dpi_proxy.py
+      --listen-host 0.0.0.0
+      --listen-port 2404
+      --backend-host 10.0.1.30
+      --backend-port 24040
+      --policy iec104_policy.json
+      --tls-port 24040
+      --log-file /app/logs/iec104_security_events.jsonl
+    ports:
+      - "2404:2404" # Sanitized IEC 60870-5-104 telecontrol gateway
+    volumes:
+      - ./logs:/app/logs
+      - ./certs:/app/certs:ro
+    depends_on:
+      iec104-mock-server:
+        condition: service_started
+      gateway-pki:
+        condition: service_completed_successfully
+    networks:
+      ot-supervisory-net:
+        ipv4_address: 192.168.1.102
+      ot-control-net:
+        ipv4_address: 10.0.1.102
+
   soc-dashboard:
     build: .
     container_name: plcsentinel-soc-dashboard
@@ -203,6 +254,7 @@ services:
     depends_on:
       - modbus-dpi-proxy
       - s7-dpi-proxy
+      - iec104-dpi-proxy
     networks:
       ot-supervisory-net:
         ipv4_address: 192.168.1.150
