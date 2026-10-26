@@ -46,7 +46,7 @@
    * **Siemens S7comm (Port 102):** S7 assessment client ([s7_sentinel.py](s7_sentinel.py)) with read-back verification and an inline S7 DPI gateway ([s7_dpi_proxy.py](s7_dpi_proxy.py)) blocking CPU Stop (`0x29`) and restricting all writes (`0x05`), logic download/upload and run-mode changes to the authorized EWS.
    * **OPC UA (IEC 62541):** Mutual X.509 PKI certificate generation ([generate_opcua_certs.py](generate_opcua_certs.py)), secure server ([opcua_secure_server.py](opcua_secure_server.py)), and encrypted client ([opcua_secure_client.py](opcua_secure_client.py)).
 2. **Inline Layer-7 Active Mitigation:**
-   * Drops unauthorized write attempts before packets reach controller memory.
+   * Only read operations are open to every host. Writes, masked and combined writes, diagnostics, vendor codes, logic transfers and S7 UserData requests (other than status reads) require the authorized engineering-workstation identity.
    * Synthesizes RFC-compliant Modbus Exceptions (`0x01` Illegal Function, `0x03` Illegal Data Value).
    * Enforces semantic process safety boundaries (e.g. overfill protection thresholds).
    * Note: the Modbus/S7 conduits authorize by **source IP** — a compensating control for unauthenticated legacy protocols, not a cryptographic identity. OPC UA is the mutually-authenticated path.

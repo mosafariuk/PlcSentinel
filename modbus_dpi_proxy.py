@@ -2,7 +2,7 @@
 """
 PlcSentinel - Upgraded Layer-7 Modbus Deep Packet Inspection (DPI) Proxy with SIEM Logging
 Enforces:
-1. Role-Based Access Control (ACL)
+1. Read-only allowlist for every host; all other function codes are EWS-only
 2. Semantic Process Boundary Inspection (Overfill Prevention)
 3. RFC-Compliant Exception Generation (0x01 Illegal Function, 0x03 Illegal Data Value)
 4. Structured SIEM JSON/ECS Event Streaming (logs/ot_security_events.jsonl)
@@ -40,7 +40,14 @@ FC_NAMES = {
     6: "Write Single Register",
     15: "Write Multiple Coils",
     16: "Write Multiple Registers",
+    22: "Mask Write Register",
+    23: "Read/Write Multiple Registers",
+    43: "Read Device Identification",
 }
+
+# Only plain reads are open to every host. Writes, FC22/23 masked and combined
+# writes, FC08 diagnostics and vendor codes all require the EWS identity.
+READ_FCS = frozenset({1, 2, 3, 4})
 
 # Holding registers 0 (High) and 1 (Low) are the tank setpoints, both scaled
 # 0..1000; neither may be pushed above the safe capacity threshold.
@@ -64,7 +71,6 @@ class ModbusDPIProxy:
         self.authorized_ews_ip = authorized_ews_ip
         self.max_safe_high_threshold = max_safe_high_threshold
         self.log_file = log_file
-        self.strict_write_lockdown = True
         self.stats = {"inspected": 0, "allowed": 0, "blocked": 0}
 
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -122,31 +128,41 @@ class ModbusDPIProxy:
         pdu = bytes([orig_fc | 0x80, exc_code])
         return mbap + pdu
 
-    def _check_setpoint_hazard(self, fc: int, raw_pkt: bytes) -> Optional[Tuple[int, int]]:
-        """Return (register, value) if a write pushes a protected setpoint
-        register (PROTECTED_SETPOINT_REGS) above the safe threshold, else None.
+    def _written_registers(self, fc: int, raw_pkt: bytes):
+        """Yield (register, value) pairs a write PDU would commit.
 
-        Handles both FC6 (Write Single Register) and FC16 (Write Multiple
-        Registers); FC16 can address a protected register inside a larger
-        block, so the whole written range is scanned.
+        FC6 carries one register; FC16 and FC23 carry a block (FC23 after its
+        read-range fields). The whole block is scanned so a protected register
+        cannot be hidden inside a bulk write.
         """
-        if fc == 6 and len(raw_pkt) >= 12:
-            reg_addr = int.from_bytes(raw_pkt[8:10], "big")
-            reg_val = int.from_bytes(raw_pkt[10:12], "big")
-            if reg_addr in PROTECTED_SETPOINT_REGS and reg_val > self.max_safe_high_threshold:
-                return reg_addr, reg_val
-        elif fc == 16 and len(raw_pkt) >= 13:
-            start_addr = int.from_bytes(raw_pkt[8:10], "big")
-            qty = int.from_bytes(raw_pkt[10:12], "big")
-            byte_count = raw_pkt[12]
-            for reg in PROTECTED_SETPOINT_REGS:
-                if not (start_addr <= reg < start_addr + qty):
-                    continue
-                off = 13 + (reg - start_addr) * 2
-                if off + 2 <= len(raw_pkt) and (off - 13) < byte_count:
-                    reg_val = int.from_bytes(raw_pkt[off:off + 2], "big")
-                    if reg_val > self.max_safe_high_threshold:
-                        return reg, reg_val
+        if fc == 6:
+            if len(raw_pkt) >= 12:
+                yield int.from_bytes(raw_pkt[8:10], "big"), int.from_bytes(raw_pkt[10:12], "big")
+            return
+        hdr = {16: 8, 23: 12}.get(fc)
+        if hdr is None or len(raw_pkt) < hdr + 5:
+            return
+        start = int.from_bytes(raw_pkt[hdr:hdr + 2], "big")
+        qty = int.from_bytes(raw_pkt[hdr + 2:hdr + 4], "big")
+        data = raw_pkt[hdr + 5:hdr + 5 + raw_pkt[hdr + 4]]
+        for i in range(min(qty, len(data) // 2)):
+            yield start + i, int.from_bytes(data[2 * i:2 * i + 2], "big")
+
+    def _check_setpoint_hazard(self, fc: int, raw_pkt: bytes) -> Optional[Tuple[int, Optional[int]]]:
+        """Return (register, value) if a write pushes a protected setpoint
+        register above the safe threshold, else None.
+
+        A masked write (FC22) to a protected register returns (register, None):
+        its result depends on the current value, which the gateway cannot see,
+        so it is refused outright.
+        """
+        if fc == 22 and len(raw_pkt) >= 10:
+            reg = int.from_bytes(raw_pkt[8:10], "big")
+            if reg in PROTECTED_SETPOINT_REGS:
+                return reg, None
+        for reg, val in self._written_registers(fc, raw_pkt):
+            if reg in PROTECTED_SETPOINT_REGS and val > self.max_safe_high_threshold:
+                return reg, val
         return None
 
     def inspect_request(self, raw_pkt: bytes, client_ip: str, client_port: int) -> Tuple[bool, Optional[bytes], str]:
@@ -163,14 +179,14 @@ class ModbusDPIProxy:
         if proto_id != 0:
             return False, None, f"Invalid Protocol ID 0x{proto_id:04X}"
 
-        is_write_fc = fc in [5, 6, 15, 16]
-
         # ----------------------------------------------------------------------
         # TIER 1: Function Code & Role-Based Authorization
+        # Read allowlist: only FC 01-04 are open to every host. Everything else
+        # requires the authorized EWS identity.
         # ----------------------------------------------------------------------
-        if is_write_fc and self.strict_write_lockdown and client_ip != self.authorized_ews_ip:
+        if fc not in READ_FCS and client_ip != self.authorized_ews_ip:
             self.stats["blocked"] += 1
-            reason = f"POLICY VIOLATION: Write Function Code {fc:02d} ({FC_NAMES.get(fc)}) denied from unauthorized IP {client_ip}"
+            reason = f"POLICY VIOLATION: Non-read Function Code {fc:02d} ({FC_NAMES.get(fc, 'Vendor/Unknown')}) denied from unauthorized IP {client_ip}"
             exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_FUNCTION)
 
             addr = int.from_bytes(raw_pkt[8:10], "big") if len(raw_pkt) >= 10 else 0
@@ -193,18 +209,24 @@ class ModbusDPIProxy:
 
         # ----------------------------------------------------------------------
         # TIER 2: Semantic Process Boundary Inspection
-        # Covers both Write Single Register (FC6) and Write Multiple Registers
-        # (FC16) so the protected high-setpoint register cannot be poisoned via
-        # the bulk-write path.
+        # Covers FC6, FC16 and FC23 writes to the protected setpoint registers
+        # and refuses FC22 masked writes to them, so the bulk, combined and
+        # masked paths cannot poison a setpoint either.
         # ----------------------------------------------------------------------
         hazard = self._check_setpoint_hazard(fc, raw_pkt)
         if hazard is not None:
             reg_addr, reg_val = hazard
             self.stats["blocked"] += 1
-            reason = (
-                f"CRITICAL PROCESS HAZARD: High Setpoint {reg_val} exceeds safe capacity "
-                f"({self.max_safe_high_threshold}). Potential loss-of-containment attack."
-            )
+            if reg_val is None:
+                reason = (
+                    f"CRITICAL PROCESS HAZARD: Masked write to protected setpoint register {reg_addr} refused; "
+                    "the resulting value cannot be verified."
+                )
+            else:
+                reason = (
+                    f"CRITICAL PROCESS HAZARD: Setpoint register {reg_addr} = {reg_val} exceeds safe capacity "
+                    f"({self.max_safe_high_threshold}). Potential loss-of-containment attack."
+                )
             exc_resp = self.generate_exception_response(trans_id, unit_id, fc, EXC_ILLEGAL_DATA_VALUE)
 
             self.emit_siem_event(
