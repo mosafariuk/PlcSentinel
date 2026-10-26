@@ -69,6 +69,13 @@ EWS_ONLY_FCS = {
     S7_FC_PLC_CONTROL: ("T0858", "Change Operating Mode (PLC Start/Restart)"),
 }
 
+# Functions every host may issue: telemetry reads and the PDU negotiation that
+# precedes them. Every other Job function is EWS-only.
+OPEN_FCS = frozenset({S7_FC_READ_VAR, S7_FC_SETUP_COMM})
+# UserData (message type 7) requests every host may issue, as (group, subfunction):
+# group 4 "CPU functions", subfunction 1 "Read SZL" (status / identification).
+OPEN_USERDATA = frozenset({(4, 1)})
+
 # S7 Memory Area Codes
 S7_AREA_NAMES = {
     0x81: "Process Inputs (%I / PE)",
@@ -171,6 +178,11 @@ class S7PacketParser:
                         "bit_offset": bit_address & 0x07
                     })
                     item_offset += 12
+        elif msg_type == 0x07 and param_len >= 8 and len(raw) >= s7_offset + 17:
+            # UserData parameter: 00 01 12 | len | method | type<<4 | group | subfunction | seq
+            group, subfunction = raw[s7_offset + 15] & 0x0F, raw[s7_offset + 16]
+            dissection["userdata"] = (group, subfunction)
+            dissection["function_name"] = f"UserData group {group} subfunction {subfunction}"
 
         return dissection
 
@@ -265,12 +277,17 @@ class S7DPIProxy:
             )
             return False, reason
 
+        # The authorized Engineering Workstation may issue anything but CPU Stop.
+        if client_ip == self.authorized_ews_ip:
+            self.stats["allowed"] += 1
+            return True, "ALLOW"
+
         # ----------------------------------------------------------------------
         # POLICY RULE 2: EWS-ONLY FUNCTIONS (MITRE T0843 / T0845 / T0858)
         # Logic download (Stuxnet-style), logic upload (exfiltration) and
         # run-mode changes are restricted to the authorized Engineering Workstation.
         # ----------------------------------------------------------------------
-        if fc in EWS_ONLY_FCS and client_ip != self.authorized_ews_ip:
+        if fc in EWS_ONLY_FCS:
             mitre_id, mitre_name = EWS_ONLY_FCS[fc]
             self.stats["blocked"] += 1
             reason = f"CRITICAL ATTACK: Unauthorized S7comm {fc_name} from non-EWS IP {client_ip}!"
@@ -291,7 +308,7 @@ class S7DPIProxy:
         # Default-deny: every Write Var (any DB, outputs, markers, timers,
         # counters) requires the authorized EWS identity. Reads stay open.
         # ----------------------------------------------------------------------
-        if fc == S7_FC_WRITE_VAR and client_ip != self.authorized_ews_ip:
+        if fc == S7_FC_WRITE_VAR:
             item = (parsed.get("write_items") or [{}])[0]
             self.stats["blocked"] += 1
             reason = (
@@ -310,9 +327,31 @@ class S7DPIProxy:
             )
             return False, reason
 
-        # Allowed read or verified operation
-        self.stats["allowed"] += 1
-        return True, "ALLOW"
+        # ----------------------------------------------------------------------
+        # POLICY RULE 4: READ ALLOWLIST
+        # Only Read Var, Setup Communication and SZL status reads are open to
+        # non-EWS hosts; unknown Job functions and other UserData are denied.
+        # ----------------------------------------------------------------------
+        if fc in OPEN_FCS or parsed.get("userdata") in OPEN_USERDATA:
+            self.stats["allowed"] += 1
+            return True, "ALLOW"
+
+        self.stats["blocked"] += 1
+        reason = (
+            f"POLICY VIOLATION: S7comm {fc_name or parsed.get('msg_type_name')} is not a read operation; "
+            f"denied from non-EWS IP {client_ip}!"
+        )
+        self.log_ecs_event(
+            action="blocked",
+            severity="high",
+            reason=reason,
+            client_ip=client_ip,
+            client_port=client_port,
+            mitre_id="T0855",
+            mitre_name="Unauthorized Command Message",
+            s7_details={"function_code": fc, "function_name": fc_name, "msg_type": parsed.get("msg_type")}
+        )
+        return False, reason
 
     def _frame_client_stream(self, buf: bytes, client_ip: str, client_port: int) -> Tuple[bytes, bytes, Optional[str]]:
         """Extract complete TPKT messages from the client byte stream and inspect each.
