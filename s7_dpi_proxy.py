@@ -89,8 +89,24 @@ POLICY_KEYS = {
     "open_userdata": list,
     "max_sessions_per_source": int,
     "max_requests_per_second": int,
+    "change_windows": list,
     "enforce": bool,
 }
+
+
+def _parse_window(w: Any) -> Dict[str, Any]:
+    """One change window: ISO-8601 start/end with timezone, the principal it is
+    for, and a different principal who approved it (two-person rule)."""
+    try:
+        start, end = datetime.fromisoformat(w["start"]), datetime.fromisoformat(w["end"])
+        principal, approver = str(w["principal"]), str(w["approved_by"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise SystemExit(f"[FATAL] change window {w!r}: needs start, end (ISO-8601 with timezone), principal, approved_by ({e})")
+    if start.tzinfo is None or end.tzinfo is None or end <= start:
+        raise SystemExit(f"[FATAL] change window {w!r}: start/end must carry a timezone and end must be after start")
+    if approver == principal:
+        raise SystemExit(f"[FATAL] change window {w!r}: approved_by must differ from principal (two-person rule)")
+    return {"start": start, "end": end, "principal": principal, "approved_by": approver}
 
 
 def load_policy(path: str) -> Dict[str, Any]:
@@ -111,6 +127,8 @@ def load_policy(path: str) -> Dict[str, Any]:
             policy["open_functions"] = [int(v) for v in policy["open_functions"]]
         if "open_userdata" in policy:
             policy["open_userdata"] = {(int(g), int(s)) for g, s in policy["open_userdata"]}
+        if "change_windows" in policy:
+            policy["change_windows"] = [_parse_window(w) for w in policy["change_windows"]]
     except (TypeError, ValueError) as e:
         raise SystemExit(f"[FATAL] Policy file {path}: open_functions must be integers and open_userdata [group, subfunction] pairs ({e})")
     return policy
@@ -241,6 +259,7 @@ class S7DPIProxy:
         authorized_ews_identities=(),
         open_fcs=OPEN_FCS,
         open_userdata=OPEN_USERDATA,
+        change_windows=None,
         log_file: str = "logs/s7_security_events.jsonl",
         enforce: bool = True,
         max_sessions_per_source: int = 8,
@@ -260,6 +279,9 @@ class S7DPIProxy:
         self.authorized_principals = frozenset(authorized_ews_ips) | frozenset(f"cn:{c}" for c in authorized_ews_identities)
         self.open_fcs = frozenset(open_fcs)
         self.open_userdata = frozenset(tuple(x) for x in open_userdata)
+        # None: logic transfers by the EWS are only logged. A list (even empty):
+        # they are refused unless a window for that principal is open now.
+        self.change_windows = None if change_windows is None else list(change_windows)
         self.log_file = log_file
         # Monitor mode: violations are inspected and logged but forwarded.
         self.enforce = enforce
@@ -334,6 +356,10 @@ class S7DPIProxy:
             s7_details={"max_sessions": self.limiter.max_sessions, "max_requests_per_second": self.limiter.max_rps}
         )
 
+    def _window_open(self, principal: str, now: Optional[datetime] = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        return any(w["principal"] == principal and w["start"] <= now <= w["end"] for w in self.change_windows)
+
     def evaluate_policy(self, parsed: Dict[str, Any], client_ip: str, client_port: int,
                         principal: Optional[str] = None) -> Tuple[bool, str]:
         """
@@ -366,7 +392,20 @@ class S7DPIProxy:
             return False, reason
 
         # The authorized Engineering Workstation may issue anything but CPU Stop.
+        # Logic transfers and run-mode changes additionally need an open change
+        # window approved by someone else, when the policy declares windows.
         if principal in self.authorized_principals:
+            if fc in EWS_ONLY_FCS and self.change_windows is not None and not self._window_open(principal):
+                mitre_id, mitre_name = EWS_ONLY_FCS[fc]
+                self.stats["blocked"] += 1
+                reason = f"POLICY VIOLATION: {fc_name} by {principal} outside an approved change window!"
+                self.log_ecs_event(
+                    action=self._deny_action(), severity="critical", reason=reason, client_ip=client_ip, client_port=client_port,
+                    mitre_id=mitre_id, mitre_name=mitre_name,
+                    s7_details={"function_code": fc, "function_name": fc_name, "declared_windows": len(self.change_windows)},
+                    principal=principal
+                )
+                return False, reason
             self.stats["allowed"] += 1
             return True, "ALLOW"
 
@@ -587,6 +626,7 @@ class S7DPIProxy:
         logger.info(f"Forwarding sanitized traffic to Siemens PLC at {self.backend_host}:{self.backend_port}")
         logger.info(f"Authorized principals             : {sorted(self.authorized_principals)}")
         logger.info(f"Open to every host                : jobs {sorted(f'0x{x:02X}' for x in self.open_fcs)}, userdata {sorted(self.open_userdata)}")
+        logger.info(f"Change windows                    : {'not enforced (logic transfers logged only)' if self.change_windows is None else f'{len(self.change_windows)} declared, two-person rule'}")
         logger.info(f"SIEM Structured Logging           : {os.path.abspath(self.log_file)}")
         logger.info(f"Mode                              : {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
         logger.info("=" * 72)
@@ -629,6 +669,7 @@ if __name__ == "__main__":
         authorized_ews_identities=policy.get("authorized_ews_identities", []),
         open_fcs=policy.get("open_functions", OPEN_FCS),
         open_userdata=policy.get("open_userdata", OPEN_USERDATA),
+        change_windows=policy.get("change_windows"),
         log_file=args.log_file,
         enforce=policy.get("enforce", True) and not args.monitor,
         max_sessions_per_source=policy.get("max_sessions_per_source", 8),
