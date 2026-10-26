@@ -16,6 +16,39 @@ import unittest
 
 import dpi_tls
 from generate_gateway_certs import make_gateway_pki
+from modbus_dpi_proxy import ModbusDPIProxy, EXC_ILLEGAL_FUNCTION
+
+ATTACKER_IP = "127.0.0.1"   # the test client's address is deliberately NOT an authorized IP
+
+
+class FakeController:
+    """One-shot TCP backend: records the first ADU it receives and echoes it back."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)
+        self.port = self.sock.getsockname()[1]
+        self.received = b""
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        try:
+            conn, _ = self.sock.accept()
+        except OSError:
+            return          # listener closed before any client arrived
+        with conn:
+            conn.settimeout(3)
+            try:
+                self.received = conn.recv(4096)
+                if self.received:
+                    conn.sendall(self.received)
+            except OSError:
+                pass
+
+    def close(self):
+        self.sock.close()
 
 
 class TlsHelperTests(unittest.TestCase):
@@ -84,6 +117,58 @@ class TlsHelperTests(unittest.TestCase):
         self.assertIsNone(dpi_tls.peer_principal(None))
         self.assertIsNone(dpi_tls.peer_principal({"subject": ((("organizationName", "x"),),)}))
         self.assertEqual(dpi_tls.peer_principal({"subject": ((("commonName", "hmi-7"),),)}), "cn:hmi-7")
+
+
+class ModbusTlsIdentityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.pki = make_gateway_pki(cls.tmp.name, ews_cn="ews-01", sans=("127.0.0.1",))
+        cls.client_ctx = dpi_tls.client_context(cls.pki["ews"], cls.pki["ews_key"], cls.pki["gateway_ca"])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def gateway(self, identities, backend_port):
+        proxy = ModbusDPIProxy(authorized_ews_ips=[], authorized_ews_identities=identities,
+                               backend_host="127.0.0.1", backend_port=backend_port,
+                               log_file=os.path.join(self.tmp.name, "tls.jsonl"), listen_host="127.0.0.1",
+                               tls_port=0, tls_cert=self.pki["gateway"], tls_key=self.pki["gateway_key"], tls_ca=self.pki["gateway_ca"])
+        listener = proxy._tls_listener(0)
+        threading.Thread(target=proxy._tls_accept_loop, args=(listener,), daemon=True).start()
+        return proxy, listener.getsockname()[1]
+
+    def write_via_tls(self, port, adu):
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
+            with self.client_ctx.wrap_socket(raw, server_hostname="127.0.0.1") as tls:
+                tls.sendall(adu)
+                return tls.recv(1024)
+
+    def test_certificate_identity_authorizes_write_from_untrusted_ip(self):
+        plc = FakeController()
+        try:
+            proxy, port = self.gateway(["ews-01"], plc.port)
+            write = bytes.fromhex("0001 0000 0006 01 06 0000 0348".replace(" ", ""))   # reg0 = 840, in range
+            self.assertEqual(self.write_via_tls(port, write), write)                     # controller's echo came back
+            plc.thread.join(3)
+            self.assertEqual(plc.received, write)                                      # forwarded in the clear to the PLC
+        finally:
+            plc.close()
+        with open(os.path.join(self.tmp.name, "tls.jsonl"), encoding="utf-8") as f:
+            event = json.loads(f.readlines()[-1])
+        self.assertEqual((event["event"]["action"], event["user"]["name"], event["source"]["ip"]), ("allowed", "ews-01", ATTACKER_IP))
+
+    def test_trusted_certificate_with_unlisted_cn_is_authenticated_but_not_authorized(self):
+        plc = FakeController()
+        try:
+            proxy, port = self.gateway(["someone-else"], plc.port)
+            write = bytes.fromhex("0002 0000 0006 01 06 0000 0348".replace(" ", ""))
+            resp = self.write_via_tls(port, write)
+            self.assertEqual(resp[7:9], bytes([0x86, EXC_ILLEGAL_FUNCTION]))          # synthetic exception from the gateway
+            self.assertEqual(plc.received, b"")                                        # nothing reached the PLC
+        finally:
+            plc.close()
 
 
 if __name__ == "__main__":
