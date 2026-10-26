@@ -64,7 +64,7 @@ hmi: ## Run terminal-based supervisory HMI console
 # AUTOMATED THREAT MITIGATION TESTS
 # ------------------------------------------------------------------------------
 test-unit: ## Run offline DPI policy unit tests (no PLC, proxies or venv extras needed)
-	@$(PY) -m unittest -v test_dpi_policy
+	@$(PY) -m unittest -v test_dpi_policy test_dpi_identity
 
 test-modbus: ## Execute automated Modbus DPI threat mitigation tests
 	@$(PY) test_dpi_firewall.py
