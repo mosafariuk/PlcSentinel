@@ -248,6 +248,7 @@ class ModbusPolicyTests(unittest.TestCase):
         self.assertEqual(frozenset(pol["read_function_codes"]), modbus_dpi_proxy.READ_FCS)
         self.assertEqual(pol["protected_registers"], modbus_dpi_proxy.PROTECTED_SETPOINT_REGS)
         self.assertEqual(pol["authorized_ews_ips"], ["192.168.1.50"])
+        self.assertEqual(pol["authorized_ews_identities"], ["ews-01"])
         self.assertTrue(pol["enforce"])
         self.assertEqual((pol["max_sessions_per_source"], pol["max_requests_per_second"]), (8, 200))
         with self.assertRaises(SystemExit):
