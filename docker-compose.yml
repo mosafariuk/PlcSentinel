@@ -106,6 +106,25 @@ services:
         ipv4_address: 10.0.1.101
 
   # ============================================================================
+  # LEVEL 2: AUTHORIZED ENGINEERING WORKSTATION (EWS)
+  # ============================================================================
+
+  ews:
+    build: .
+    container_name: plcsentinel-ews
+    restart: unless-stopped
+    # Idle host parked on the one address the DPI gateways trust for writes.
+    # `make test-ews` runs test_ews_authorized.py inside it to prove the
+    # allow side of the conduit policy end to end.
+    command: sleep infinity
+    depends_on:
+      - modbus-dpi-proxy
+      - s7-dpi-proxy
+    networks:
+      ot-supervisory-net:
+        ipv4_address: 192.168.1.50
+
+  # ============================================================================
   # LEVEL 2 / SOC: UNIFIED OT SOC THREAT DASHBOARD
   # ============================================================================
 
