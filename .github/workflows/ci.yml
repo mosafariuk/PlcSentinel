@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - run: python3 -m unittest -v test_dpi_policy test_dpi_identity
+      - run: python3 -m unittest -v test_dpi_policy test_dpi_identity test_iec104
 
   image-build:
     name: Build lab image and resolve pinned dependencies
