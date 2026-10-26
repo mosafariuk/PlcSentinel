@@ -97,7 +97,7 @@ Our physical simulation represents an industrial reservoir with inflow and drain
 
 * **Pump Contactor (`%QX0.0`):** Automatically energizes when water drops below `LowThreshold` (20.0% / `200`) and shuts off at `HighThreshold` (85.0% / `850`).
 * **Emergency Drain Valve (`%QX0.1`):** Opens immediately if water reaches 95.0% (`950`) to prevent tank rupture.
-* **Safety Interlock:** If the physical Normally Closed Emergency Stop button (`%IX0.2`) trips or water level reaches `HighThreshold`, the pump is instantly forced `OFF`.
+* **Safety Interlock:** If the physical Normally Closed Emergency Stop button (`%QX0.4`, a writable bit in the simulated lab) trips or water level reaches `HighThreshold`, the pump is instantly forced `OFF`.
 
 ---
 
@@ -287,7 +287,7 @@ In our lab, we deployed an IEC 62541 OPC UA server (`opcua_secure_server.py`) an
 | :--- | :--- | :--- | :--- |
 | **Authentication (FR 1)** | None | Mutual X.509 Certificates + User Tokens | Eliminates spoofing & unauthorized devices |
 | **Access Control (FR 2)** | Open to all IP packets | Granular Node-Level Access Control Lists | Read/Write permissions enforced per tag |
-| **Integrity (FR 3)** | TCP checksum only | HMAC-SHA256 Cryptographic Signatures | Eliminates in-flight packet tampering |
+| **Integrity (FR 3)** | TCP checksum only | RSA-SHA256 handshake signatures + HMAC-SHA256 message signing | Eliminates in-flight packet tampering |
 | **Confidentiality (FR 4)**| Cleartext | AES-256-CBC Payload Encryption | Neutralizes passive network eavesdropping |
 | **Replay Protection** | None (Static frames) | Cryptographic Sequence IDs & Nonces | Prevents capture-and-replay attacks |
 | **IEC 62443 Max SL** | SL 1 (Without gateway) | **SL 3 / SL 4 Native** | Meets highest critical infrastructure tiers |
@@ -303,7 +303,7 @@ No software control, firewall rule, or encryption algorithm is invincible. Zero-
 
 In our water tank model:
 * **The Digital Defense:** The OpenPLC logic monitors water level and commands the pump contactor to de-energize at `850` (85.0%).
-* **The Physical Defense (Level 0 Decoupling):** A mechanical float switch (`%IX0.1`) and the Emergency Stop button (`%IX0.2`) are **hardwired in series directly with the physical coil power supply of the pump contactor**.
+* **The Physical Defense (Level 0 Decoupling):** A mechanical float switch (`%IX0.1`) and the Emergency Stop button (`%QX0.4`) are **hardwired in series directly with the physical coil power supply of the pump contactor**.
 
 If an attacker completely compromises the PLC, bypasses the DPI firewall, and overwrites the setpoint to `9999`, the physical circuit physically breaks when the liquid trips the mechanical float at Level 0. Power to the pump drops instantly, preventing loss of containment regardless of what the corrupted PLC software memory reports.
 
