@@ -11,7 +11,7 @@ Architectural Role:
   1. Blocks unauthorized PLC Control / CPU Stop commands (MITRE ATT&CK T0805 / T0814).
   2. Blocks unauthorized Program Download / Firmware upload attempts (MITRE ATT&CK T0843 / T0873).
   3. Restricts S7comm Write Var (0x05) jobs exclusively to authorized EWS IP addresses (MITRE ATT&CK T0855).
-  4. Protects critical Data Blocks (DBs) and outputs against unauthorized tampering (MITRE ATT&CK T0836).
+  4. Restricts program upload (0x1D-0x1F) and PLC start/restart (0x28) to the authorized EWS (MITRE ATT&CK T0845 / T0858).
   5. Emits real-time Elastic Common Schema (ECS) JSON security telemetry.
 """
 
@@ -22,7 +22,7 @@ import asyncio
 import logging
 import argparse
 from datetime import datetime, timezone
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +56,17 @@ FC_NAMES = {
     0x28: "PLC Control (Start/Restart)",
     0x29: "PLC Stop (CPU Stop Command)",
     0xF0: "Setup Communication (PDU Negotiate)",
+}
+
+# Functions that only the authorized Engineering Workstation may issue.
+EWS_ONLY_FCS = {
+    S7_FC_REQUEST_DOWNLOAD: ("T0843", "Program Download / Logic Modification"),
+    S7_FC_DOWNLOAD_BLOCK: ("T0843", "Program Download / Logic Modification"),
+    S7_FC_DOWNLOAD_ENDED: ("T0843", "Program Download / Logic Modification"),
+    S7_FC_START_UPLOAD: ("T0845", "Program Upload / Logic Exfiltration"),
+    S7_FC_UPLOAD: ("T0845", "Program Upload / Logic Exfiltration"),
+    S7_FC_END_UPLOAD: ("T0845", "Program Upload / Logic Exfiltration"),
+    S7_FC_PLC_CONTROL: ("T0858", "Change Operating Mode (PLC Start/Restart)"),
 }
 
 # S7 Memory Area Codes
@@ -140,11 +151,13 @@ class S7PacketParser:
                 item_offset = s7_offset + 12
 
                 for _ in range(item_count):
-                    if len(raw) < item_offset + 12:
-                        break
                     # S7ANY Addressing Item Structure (12 bytes)
                     # [0]: Spec Type (0x12), [1]: Length (0x0A), [2]: Syntax ID (0x10)
                     # [4..5]: Count/Length, [6..7]: DB Number, [8]: Area Code, [9..11]: 3-Byte Address
+                    # Truncated or non-S7ANY items are unparseable -> fail closed
+                    # (a different item length would desync the fixed 12-byte stride).
+                    if len(raw) < item_offset + 12 or raw[item_offset:item_offset + 3] != b"\x12\x0a\x10":
+                        return None
                     db_num = int.from_bytes(raw[item_offset + 6 : item_offset + 8], "big")
                     area_code = raw[item_offset + 8]
                     bit_address = int.from_bytes(raw[item_offset + 9 : item_offset + 12], "big")
@@ -174,7 +187,6 @@ class S7DPIProxy:
         backend_host: str = "127.0.0.1",
         backend_port: int = 102,
         authorized_ews_ip: str = "192.168.1.50",
-        critical_dbs: Optional[List[int]] = None,
         log_file: str = "logs/s7_security_events.jsonl"
     ):
         self.listen_host = listen_host
@@ -182,8 +194,6 @@ class S7DPIProxy:
         self.backend_host = backend_host
         self.backend_port = backend_port
         self.authorized_ews_ip = authorized_ews_ip
-        # Critical DBs protected from write operations without authorized EWS identity
-        self.critical_dbs = critical_dbs or [1, 2, 10]
         self.log_file = log_file
 
         self.stats = {"sessions": 0, "packets": 0, "allowed": 0, "blocked": 0}
@@ -256,54 +266,49 @@ class S7DPIProxy:
             return False, reason
 
         # ----------------------------------------------------------------------
-        # POLICY RULE 2: UNAUTHORIZED PROGRAM / LOGIC DOWNLOAD (MITRE T0843 / T0873)
-        # Prevents Stuxnet-style malicious logic downloads or firmware tampering
+        # POLICY RULE 2: EWS-ONLY FUNCTIONS (MITRE T0843 / T0845 / T0858)
+        # Logic download (Stuxnet-style), logic upload (exfiltration) and
+        # run-mode changes are restricted to the authorized Engineering Workstation.
         # ----------------------------------------------------------------------
-        if fc in [S7_FC_REQUEST_DOWNLOAD, S7_FC_DOWNLOAD_BLOCK, S7_FC_DOWNLOAD_ENDED]:
-            if client_ip != self.authorized_ews_ip:
-                self.stats["blocked"] += 1
-                reason = f"CRITICAL ATTACK: Unauthorized S7comm Program Download ({fc_name}) from non-EWS IP {client_ip}!"
-                self.log_ecs_event(
-                    action="blocked",
-                    severity="critical",
-                    reason=reason,
-                    client_ip=client_ip,
-                    client_port=client_port,
-                    mitre_id="T0843",
-                    mitre_name="Program Download / Logic Modification",
-                    s7_details={"function_code": fc, "function_name": fc_name}
-                )
-                return False, reason
+        if fc in EWS_ONLY_FCS and client_ip != self.authorized_ews_ip:
+            mitre_id, mitre_name = EWS_ONLY_FCS[fc]
+            self.stats["blocked"] += 1
+            reason = f"CRITICAL ATTACK: Unauthorized S7comm {fc_name} from non-EWS IP {client_ip}!"
+            self.log_ecs_event(
+                action="blocked",
+                severity="critical",
+                reason=reason,
+                client_ip=client_ip,
+                client_port=client_port,
+                mitre_id=mitre_id,
+                mitre_name=mitre_name,
+                s7_details={"function_code": fc, "function_name": fc_name}
+            )
+            return False, reason
 
         # ----------------------------------------------------------------------
-        # POLICY RULE 3: DATA BLOCK & ACTUATOR WRITE CONTROL (MITRE T0855 / T0836)
-        # Protects critical DB setpoints and outputs against unauthorized writes
+        # POLICY RULE 3: WRITE CONTROL (MITRE T0855 / T0836)
+        # Default-deny: every Write Var (any DB, outputs, markers, timers,
+        # counters) requires the authorized EWS identity. Reads stay open.
         # ----------------------------------------------------------------------
-        if fc == S7_FC_WRITE_VAR:
-            write_items = parsed.get("write_items", [])
-            for item in write_items:
-                db_num = item.get("db_number")
-                area_code = item.get("area_code")
-                area_name = item.get("area_name")
-
-                # If write targets a critical DB or outputs, enforce EWS authorization
-                if (db_num in self.critical_dbs or area_code == 0x82) and client_ip != self.authorized_ews_ip:
-                    self.stats["blocked"] += 1
-                    reason = (
-                        f"POLICY VIOLATION: Unauthorized S7comm Write targeting {area_name} "
-                        f"(DB{db_num}.DBB{item.get('byte_offset')}) from IP {client_ip}!"
-                    )
-                    self.log_ecs_event(
-                        action="blocked",
-                        severity="high",
-                        reason=reason,
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        mitre_id="T0855",
-                        mitre_name="Unauthorized Command Message",
-                        s7_details={"function_code": fc, "function_name": fc_name, "target_item": item}
-                    )
-                    return False, reason
+        if fc == S7_FC_WRITE_VAR and client_ip != self.authorized_ews_ip:
+            item = (parsed.get("write_items") or [{}])[0]
+            self.stats["blocked"] += 1
+            reason = (
+                f"POLICY VIOLATION: Unauthorized S7comm Write targeting {item.get('area_name', 'unknown area')} "
+                f"(DB{item.get('db_number')}.DBB{item.get('byte_offset')}) from IP {client_ip}!"
+            )
+            self.log_ecs_event(
+                action="blocked",
+                severity="high",
+                reason=reason,
+                client_ip=client_ip,
+                client_port=client_port,
+                mitre_id="T0855",
+                mitre_name="Unauthorized Command Message",
+                s7_details={"function_code": fc, "function_name": fc_name, "target_item": item}
+            )
+            return False, reason
 
         # Allowed read or verified operation
         self.stats["allowed"] += 1
@@ -422,7 +427,6 @@ class S7DPIProxy:
         logger.info(f"S7comm Layer-7 DPI Proxy ACTIVE on {self.listen_host}:{self.listen_port}")
         logger.info(f"Forwarding sanitized traffic to Siemens PLC at {self.backend_host}:{self.backend_port}")
         logger.info(f"Authorized Engineering Station IP : {self.authorized_ews_ip}")
-        logger.info(f"Protected Critical Data Blocks    : DB {self.critical_dbs}")
         logger.info(f"SIEM Structured Logging           : {os.path.abspath(self.log_file)}")
         logger.info("=" * 72)
 

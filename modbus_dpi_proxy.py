@@ -42,6 +42,10 @@ FC_NAMES = {
     16: "Write Multiple Registers",
 }
 
+# Holding registers 0 (High) and 1 (Low) are the tank setpoints, both scaled
+# 0..1000; neither may be pushed above the safe capacity threshold.
+PROTECTED_SETPOINT_REGS = (0, 1)
+
 class ModbusDPIProxy:
     def __init__(
         self,
@@ -119,30 +123,30 @@ class ModbusDPIProxy:
         return mbap + pdu
 
     def _check_setpoint_hazard(self, fc: int, raw_pkt: bytes) -> Optional[Tuple[int, int]]:
-        """Return (register, value) if a write targets the protected high-setpoint
-        register (0) with a value above the safe threshold, else None.
+        """Return (register, value) if a write pushes a protected setpoint
+        register (PROTECTED_SETPOINT_REGS) above the safe threshold, else None.
 
         Handles both FC6 (Write Single Register) and FC16 (Write Multiple
-        Registers); FC16 can address register 0 inside a larger block, so the
-        whole written range is scanned.
+        Registers); FC16 can address a protected register inside a larger
+        block, so the whole written range is scanned.
         """
         if fc == 6 and len(raw_pkt) >= 12:
             reg_addr = int.from_bytes(raw_pkt[8:10], "big")
             reg_val = int.from_bytes(raw_pkt[10:12], "big")
-            if reg_addr == 0 and reg_val > self.max_safe_high_threshold:
+            if reg_addr in PROTECTED_SETPOINT_REGS and reg_val > self.max_safe_high_threshold:
                 return reg_addr, reg_val
         elif fc == 16 and len(raw_pkt) >= 13:
             start_addr = int.from_bytes(raw_pkt[8:10], "big")
             qty = int.from_bytes(raw_pkt[10:12], "big")
             byte_count = raw_pkt[12]
-            # Is the protected register 0 inside the written range?
-            if start_addr <= 0 < start_addr + qty:
-                idx = 0 - start_addr
-                off = 13 + idx * 2
+            for reg in PROTECTED_SETPOINT_REGS:
+                if not (start_addr <= reg < start_addr + qty):
+                    continue
+                off = 13 + (reg - start_addr) * 2
                 if off + 2 <= len(raw_pkt) and (off - 13) < byte_count:
                     reg_val = int.from_bytes(raw_pkt[off:off + 2], "big")
                     if reg_val > self.max_safe_high_threshold:
-                        return 0, reg_val
+                        return reg, reg_val
         return None
 
     def inspect_request(self, raw_pkt: bytes, client_ip: str, client_port: int) -> Tuple[bool, Optional[bytes], str]:
