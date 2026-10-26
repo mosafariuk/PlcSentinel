@@ -50,10 +50,12 @@
    * Synthesizes RFC-compliant Modbus Exceptions (`0x01` Illegal Function, `0x03` Illegal Data Value).
    * Enforces semantic process safety boundaries (e.g. overfill protection thresholds).
    * Policy lives in `modbus_policy.json` / `s7_policy.json` (authorized stations, open function codes, protected registers and their limits), validated at startup; CLI flags override it.
+   * Per-source caps on concurrent sessions and requests per second (policy keys `max_sessions_per_source`, `max_requests_per_second`) stop one host exhausting the controller's connection table through the gateway; they apply in both modes and log MITRE T0814 events.
    * `--monitor` runs either gateway inline in detect-only mode: violations are logged as `detected` and forwarded, so a site can observe before enforcing.
    * Note: the Modbus/S7 conduits authorize by **source IP** — a compensating control for unauthenticated legacy protocols, not a cryptographic identity. OPC UA is the mutually-authenticated path.
 3. **Unified OT SOC Threat Dashboard:**
    * Console-based SIEM dashboard ([soc_dashboard.py](soc_dashboard.py)) streaming structured **Elastic Common Schema (ECS)** logs enriched with MITRE ATT&CK for ICS tags (`T0855`, `T0836`, `T0805`).
+   * `--siem-udp HOST:PORT` on either gateway also forwards every event as a JSON datagram to an Elastic, Logstash or Wazuh collector, so no shared log volume is needed.
 4. **Complete Technical Documentation:**
    * [ARTICLE_PlcSentinel_ICS_Security.md](ARTICLE_PlcSentinel_ICS_Security.md): Full publication-grade whitepaper.
    * [PlcSentinel_Lab_Guide.md](PlcSentinel_Lab_Guide.md): 7-Day structured hands-on curriculum.
@@ -127,6 +129,7 @@ PlcSentinel/
 ├── iec62443_hardening_report.md         # IEC 62443 compliance report
 ├── wireshark_filters.txt                # Curated Wireshark filters & color rules
 ├── tank_control.st                      # IEC 61131-3 Structured Text logic
+├── dpi_limits.py                        # Per-source session and request-rate caps shared by both gateways
 ├── modbus_dpi_proxy.py                  # Inline Modbus L7 DPI Gateway with ECS logging
 ├── modbus_policy.json                   # Modbus gateway policy: authorized EWS, open FCs, protected registers
 ├── read_via_proxy.py                    # Telemetry reader via Modbus DPI proxy
