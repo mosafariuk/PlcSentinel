@@ -15,19 +15,13 @@ Architectural Role:
   5. Emits real-time Elastic Common Schema (ECS) JSON security telemetry.
 """
 
-import os
-import sys
-import json
-import ssl
-import socket
 import asyncio
 import logging
 import argparse
 from datetime import datetime, timezone
 from typing import Tuple, Optional, Dict, Any
 
-from dpi_limits import SourceLimiter
-from dpi_tls import server_context, peer_principal
+from dpi_stream import StreamDPIProxy, COMMON_POLICY_KEYS, load_policy_file, add_common_arguments, common_kwargs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,15 +77,11 @@ OPEN_USERDATA = frozenset({(4, 1)})
 
 # JSON policy file keys and their types; CLI flags override file values.
 POLICY_KEYS = {
-    "authorized_ews_ips": list,
-    "authorized_ews_identities": list,
+    **COMMON_POLICY_KEYS,
     "open_functions": list,
     "open_userdata": list,
-    "max_sessions_per_source": int,
-    "max_requests_per_second": int,
     "change_windows": list,
     "protected_db_words": list,
-    "enforce": bool,
 }
 
 
@@ -110,34 +100,24 @@ def _parse_window(w: Any) -> Dict[str, Any]:
     return {"start": start, "end": end, "principal": principal, "approved_by": approver}
 
 
+def _convert_policy(policy: Dict[str, Any]) -> None:
+    if "open_functions" in policy:
+        policy["open_functions"] = [int(v) for v in policy["open_functions"]]
+    if "open_userdata" in policy:
+        policy["open_userdata"] = {(int(g), int(s)) for g, s in policy["open_userdata"]}
+    if "change_windows" in policy:
+        policy["change_windows"] = [_parse_window(w) for w in policy["change_windows"]]
+    if "protected_db_words" in policy:
+        policy["protected_db_words"] = [
+            {"db": int(w["db"]), "offset": int(w["offset"]), "min": int(w.get("min", 0)), "max": int(w["max"])}
+            for w in policy["protected_db_words"]]
+
+
 def load_policy(path: str) -> Dict[str, Any]:
-    """Read and validate a JSON policy file. Any problem is fatal at startup:
-    a gateway must never run on a policy it only half understood."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            policy = json.load(f)
-    except (OSError, ValueError) as e:
-        raise SystemExit(f"[FATAL] Cannot read policy file {path}: {e}")
-    if not isinstance(policy, dict) or set(policy) - set(POLICY_KEYS):
-        raise SystemExit(f"[FATAL] Policy file {path}: expected an object with keys {sorted(POLICY_KEYS)}")
-    for key, typ in POLICY_KEYS.items():
-        if key in policy and (not isinstance(policy[key], typ) or (typ is int and isinstance(policy[key], bool))):
-            raise SystemExit(f"[FATAL] Policy file {path}: {key!r} must be a JSON {typ.__name__}")
-    try:
-        if "open_functions" in policy:
-            policy["open_functions"] = [int(v) for v in policy["open_functions"]]
-        if "open_userdata" in policy:
-            policy["open_userdata"] = {(int(g), int(s)) for g, s in policy["open_userdata"]}
-        if "change_windows" in policy:
-            policy["change_windows"] = [_parse_window(w) for w in policy["change_windows"]]
-        if "protected_db_words" in policy:
-            policy["protected_db_words"] = [
-                {"db": int(w["db"]), "offset": int(w["offset"]), "min": int(w.get("min", 0)), "max": int(w["max"])}
-                for w in policy["protected_db_words"]]
-    except (TypeError, ValueError, KeyError) as e:
-        raise SystemExit(f"[FATAL] Policy file {path}: open_functions must be integers, open_userdata [group, subfunction] pairs, "
-                         f"protected_db_words objects with db, offset, max (and optional min) ({e})")
-    return policy
+    return load_policy_file(path, POLICY_KEYS, _convert_policy,
+                            "open_functions must be integers, open_userdata [group, subfunction] pairs, "
+                            "protected_db_words objects with db, offset, max (and optional min)")
+
 
 # S7 Memory Area Codes
 S7_AREA_NAMES = {
@@ -263,10 +243,15 @@ class S7PacketParser:
         return dissection
 
 
-class S7DPIProxy:
+class S7DPIProxy(StreamDPIProxy):
     """
     Inline Asynchronous S7comm Deep Packet Inspection Gateway.
     """
+    DATASET = "ics.s7comm"
+    PROTOCOL = "s7comm"
+    DETAILS_KEY = "s7comm"
+    NAME = "S7comm"
+    APPLICATION = "siemens_simatic"
 
     def __init__(
         self,
@@ -281,22 +266,10 @@ class S7DPIProxy:
         change_windows=None,
         protected_db_words=(),
         log_file: str = "logs/s7_security_events.jsonl",
-        enforce: bool = True,
-        max_sessions_per_source: int = 8,
-        max_requests_per_second: int = 200,
-        siem_udp: Optional[Tuple[str, int]] = None,
-        tls_port: Optional[int] = None,
-        tls_cert: str = "certs/gateway_cert.pem",
-        tls_key: str = "certs/gateway_key.pem",
-        tls_ca: str = "certs/gateway_ca_cert.pem"
+        **common
     ):
-        self.listen_host = listen_host
-        self.listen_port = listen_port
-        self.backend_host = backend_host
-        self.backend_port = backend_port
-        # A principal is a source IP (plain listener) or "cn:<CommonName>" of a
-        # client certificate issued by the lab CA (mutual-TLS listener).
-        self.authorized_principals = frozenset(authorized_ews_ips) | frozenset(f"cn:{c}" for c in authorized_ews_identities)
+        super().__init__(listen_host, listen_port, backend_host, backend_port,
+                         authorized_ews_ips, authorized_ews_identities, log_file, **common)
         self.open_fcs = frozenset(open_fcs)
         self.open_userdata = frozenset(tuple(x) for x in open_userdata)
         # None: logic transfers by the EWS are only logged. A list (even empty):
@@ -304,80 +277,13 @@ class S7DPIProxy:
         self.change_windows = None if change_windows is None else list(change_windows)
         # Signed 16-bit DB words that may not leave [min, max], whoever writes them.
         self.protected_db_words = [dict(w) for w in protected_db_words]
-        self.log_file = log_file
-        # Monitor mode: violations are inspected and logged but forwarded.
-        self.enforce = enforce
-        self.limiter = SourceLimiter(max_sessions_per_source, max_requests_per_second)
-        self._siem_udp = siem_udp
-        self._siem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if siem_udp else None
-        self.tls_port = tls_port
-        try:
-            self._tls_ctx = server_context(tls_cert, tls_key, tls_ca) if tls_port is not None else None
-        except (OSError, ssl.SSLError) as e:
-            raise SystemExit(f"[FATAL] Cannot load TLS material for the mutual-TLS listener: {e}")
 
-        self.stats = {"sessions": 0, "packets": 0, "allowed": 0, "blocked": 0}
-        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-
-    def log_ecs_event(
-        self,
-        action: str,
-        severity: str,
-        reason: str,
-        client_ip: str,
-        client_port: int,
-        mitre_id: Optional[str] = None,
-        mitre_name: Optional[str] = None,
-        s7_details: Optional[Dict[str, Any]] = None,
-        principal: Optional[str] = None
-    ):
-        """Emits an Elastic Common Schema (ECS) JSON event log."""
-        event = {
-            "@timestamp": datetime.now(timezone.utc).isoformat(),
-            "event": {
-                "dataset": "ics.s7comm",
-                "action": action,
-                "category": ["network", "intrusion_detection"],
-                "type": ["access", "protocol"],
-                "outcome": "success" if action == "allowed" else "failure",
-                "severity_label": severity,
-            },
-            "source": {"ip": client_ip, "port": client_port},
-            "destination": {"ip": self.listen_host, "port": self.listen_port},
-            "network": {"transport": "tcp", "protocol": "s7comm", "application": "siemens_simatic"},
-            "s7comm": s7_details or {},
-            "rule": {
-                "description": reason,
-                "mitre": {
-                    "id": mitre_id,
-                    "name": mitre_name,
-                    "tactic": "Inhibit Response Function / Impact" if mitre_id else None
-                }
-            }
-        }
-        if principal and principal.startswith("cn:"):
-            event["user"] = {"name": principal[3:]}
-        # Write Var items carry raw payload bytes; log them as hex.
-        line = json.dumps(event, default=lambda o: o.hex() if isinstance(o, (bytes, bytearray)) else str(o)) + "\n"
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(line)
-        if self._siem_sock:
-            try:
-                self._siem_sock.sendto(line.encode("utf-8"), self._siem_udp)
-            except OSError as e:
-                logger.warning(f"SIEM UDP forward to {self._siem_udp} failed: {e}")
-
-    def _deny_action(self) -> str:
-        return "blocked" if self.enforce else "detected"
-
-    def _emit_limit_event(self, client_ip: str, client_port: int, reason: str):
-        """Resource caps protect the gateway and controller, so they apply in both modes."""
-        logger.warning(f"[BLOCKED] {reason}")
-        self.log_ecs_event(
-            action="blocked", severity="high", reason=reason, client_ip=client_ip, client_port=client_port,
-            mitre_id="T0814", mitre_name="Denial of Service",
-            s7_details={"max_sessions": self.limiter.max_sessions, "max_requests_per_second": self.limiter.max_rps}
-        )
+    def _banner_lines(self):
+        return [
+            f"Open to every host                : jobs {sorted(f'0x{x:02X}' for x in self.open_fcs)}, userdata {sorted(self.open_userdata)}",
+            f"Protected DB words                : {self.protected_db_words or 'none'}",
+            f"Change windows                    : {'not enforced (logic transfers logged only)' if self.change_windows is None else f'{len(self.change_windows)} declared, two-person rule'}",
+        ]
 
     def _check_db_word_hazard(self, items) -> Optional[Tuple[Dict[str, int], int]]:
         """Return (rule, value) for the first protected DB word a write would push out of range."""
@@ -423,7 +329,7 @@ class S7DPIProxy:
                 client_port=client_port,
                 mitre_id="T0805",
                 mitre_name="Point & Physical Device Control / CPU Stop",
-                s7_details={"function_code": fc, "function_name": fc_name},
+                details={"function_code": fc, "function_name": fc_name},
                 principal=principal
             )
             return False, reason
@@ -442,7 +348,7 @@ class S7DPIProxy:
                 self.log_ecs_event(
                     action=self._deny_action(), severity="critical", reason=reason, client_ip=client_ip, client_port=client_port,
                     mitre_id="T0836", mitre_name="Modify Parameter",
-                    s7_details={"function_code": fc, "function_name": fc_name, "target": rule, "attempted_value": value},
+                    details={"function_code": fc, "function_name": fc_name, "target": rule, "attempted_value": value},
                     principal=principal
                 )
                 return False, reason
@@ -458,7 +364,7 @@ class S7DPIProxy:
                 self.log_ecs_event(
                     action=self._deny_action(), severity="critical", reason=reason, client_ip=client_ip, client_port=client_port,
                     mitre_id=mitre_id, mitre_name=mitre_name,
-                    s7_details={"function_code": fc, "function_name": fc_name, "declared_windows": len(self.change_windows)},
+                    details={"function_code": fc, "function_name": fc_name, "declared_windows": len(self.change_windows)},
                     principal=principal
                 )
                 return False, reason
@@ -482,7 +388,7 @@ class S7DPIProxy:
                 client_port=client_port,
                 mitre_id=mitre_id,
                 mitre_name=mitre_name,
-                s7_details={"function_code": fc, "function_name": fc_name},
+                details={"function_code": fc, "function_name": fc_name},
                 principal=principal
             )
             return False, reason
@@ -507,7 +413,7 @@ class S7DPIProxy:
                 client_port=client_port,
                 mitre_id="T0855",
                 mitre_name="Unauthorized Command Message",
-                s7_details={"function_code": fc, "function_name": fc_name, "target_item": item},
+                details={"function_code": fc, "function_name": fc_name, "target_item": item},
                 principal=principal
             )
             return False, reason
@@ -534,7 +440,7 @@ class S7DPIProxy:
             client_port=client_port,
             mitre_id="T0855",
             mitre_name="Unauthorized Command Message",
-            s7_details={"function_code": fc, "function_name": fc_name, "msg_type": parsed.get("msg_type")},
+            details={"function_code": fc, "function_name": fc_name, "msg_type": parsed.get("msg_type")},
             principal=principal
         )
         return False, reason
@@ -584,159 +490,20 @@ class S7DPIProxy:
             out += msg
         return out, buf, None
 
-    async def pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, is_client: bool,
-                   client_ip: str, client_port: int, principal: Optional[str] = None):
-        """Asynchronously pipes data between client and backend with Layer-7 DPI."""
-        buf = b""
-        try:
-            while not reader.at_eof():
-                data = await reader.read(4096)
-                if not data:
-                    break
-
-                if not is_client:
-                    # PLC -> client responses are forwarded unmodified.
-                    writer.write(data)
-                    await writer.drain()
-                    continue
-
-                buf += data
-                out, buf, drop_reason = self._frame_client_stream(buf, client_ip, client_port, principal)
-                if out:
-                    writer.write(out)
-                    await writer.drain()
-                if drop_reason is not None:
-                    logger.warning(f"[BLOCKED] Inbound packet dropped! Reason: {drop_reason}")
-                    # Immediately terminate connection to protect the PLC
-                    writer.close()
-                    await writer.wait_closed()
-                    return
-        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
-            pass
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-    async def handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
-        """Handles an incoming connection from HMI / EWS / Attacker."""
-        self.stats["sessions"] += 1
-        client_addr = client_writer.get_extra_info("peername")
-        client_ip, client_port = client_addr[0], client_addr[1]
-        principal = None
-        ssl_object = client_writer.get_extra_info("ssl_object")
-        if ssl_object is not None:
-            principal = peer_principal(ssl_object.getpeercert())
-            if principal is None:
-                logger.warning(f"[BLOCKED] TLS client {client_ip}:{client_port} presented a certificate without a Common Name")
-                client_writer.close()
-                await client_writer.wait_closed()
-                return
-        logger.info(f"[+] Incoming S7 session accepted from {client_ip}:{client_port}" + (f" as {principal}" if principal else ""))
-        if not self.limiter.open_session(client_ip):
-            self._emit_limit_event(client_ip, client_port,
-                                   f"Session cap: {self.limiter.max_sessions} sessions already open from {client_ip}; refusing another")
-            client_writer.close()
-            await client_writer.wait_closed()
-            return
-        try:
-            await self._serve_session(client_reader, client_writer, client_ip, client_port, principal)
-        finally:
-            self.limiter.close_session(client_ip)
-
-    async def _serve_session(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter,
-                             client_ip: str, client_port: int, principal: Optional[str] = None):
-        # Connect to backend Siemens PLC
-        try:
-            plc_reader, plc_writer = await asyncio.wait_for(
-                asyncio.open_connection(self.backend_host, self.backend_port),
-                timeout=3.0
-            )
-        except Exception as e:
-            logger.error(f"[-] Cannot reach backend Siemens PLC ({self.backend_host}:{self.backend_port}): {e}")
-            client_writer.close()
-            await client_writer.wait_closed()
-            return
-
-        # Bi-directional asynchronous piping
-        client_to_plc = asyncio.create_task(
-            self.pipe(client_reader, plc_writer, is_client=True, client_ip=client_ip, client_port=client_port, principal=principal)
-        )
-        plc_to_client = asyncio.create_task(
-            self.pipe(plc_reader, client_writer, is_client=False, client_ip=client_ip, client_port=client_port)
-        )
-
-        await asyncio.gather(client_to_plc, plc_to_client, return_exceptions=True)
-        logger.info(f"[*] S7 session closed for {client_ip}:{client_port} | Total Stats: {self.stats}")
-
-    async def start(self):
-        servers = [await asyncio.start_server(self.handle_client, self.listen_host, self.listen_port)]
-        if self._tls_ctx:
-            servers.append(await asyncio.start_server(self.handle_client, self.listen_host, self.tls_port, ssl=self._tls_ctx))
-        logger.info("=" * 72)
-        logger.info(f"S7comm Layer-7 DPI Proxy ACTIVE on {self.listen_host}:{self.listen_port}")
-        if self._tls_ctx:
-            logger.info(f"Mutual-TLS listener (reach it with ews_tls_tunnel.py) on {self.listen_host}:{self.tls_port}")
-        logger.info(f"Forwarding sanitized traffic to Siemens PLC at {self.backend_host}:{self.backend_port}")
-        logger.info(f"Authorized principals             : {sorted(self.authorized_principals)}")
-        logger.info(f"Open to every host                : jobs {sorted(f'0x{x:02X}' for x in self.open_fcs)}, userdata {sorted(self.open_userdata)}")
-        logger.info(f"Protected DB words                : {self.protected_db_words or 'none'}")
-        logger.info(f"Change windows                    : {'not enforced (logic transfers logged only)' if self.change_windows is None else f'{len(self.change_windows)} declared, two-person rule'}")
-        logger.info(f"SIEM Structured Logging           : {os.path.abspath(self.log_file)}")
-        logger.info(f"Mode                              : {'ENFORCE' if self.enforce else 'MONITOR (violations logged as detected, traffic forwarded)'}")
-        logger.info("=" * 72)
-
-        try:
-            await asyncio.gather(*(s.serve_forever() for s in servers))
-        finally:
-            for s in servers:
-                s.close()
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="S7comm Layer-7 DPI Conduit Gateway")
-    parser.add_argument("--listen-host", type=str, default="0.0.0.0", help="DPI Proxy listen IP (default: 0.0.0.0)")
-    parser.add_argument("--listen-port", type=int, default=10200, help="DPI Proxy listen port (default: 10200)")
-    parser.add_argument("--backend-host", type=str, default="127.0.0.1", help="Backend PLC IP (default: 127.0.0.1)")
-    parser.add_argument("--backend-port", type=int, default=1102, help="Backend PLC port (default: 1102 or 102)")
-    parser.add_argument("--policy", type=str, help="JSON policy file (see s7_policy.json); explicit CLI flags override it")
-    parser.add_argument("--authorized-ews", action="append", default=None, help="Authorized EWS IP; repeatable (default: 192.168.1.50)")
-    parser.add_argument("--log-file", type=str, default="logs/s7_security_events.jsonl", help="SIEM event output path")
-    parser.add_argument("--monitor", action="store_true", help="Log policy violations but forward all traffic (observe inline before enforcing)")
-    parser.add_argument("--siem-udp", type=str, metavar="HOST:PORT", help="Also send every event as a JSON datagram to this collector (Elastic/Logstash/Wazuh)")
-    parser.add_argument("--tls-port", type=int, default=None, help="Also listen for mutual-TLS sessions (ews_tls_tunnel.py) on this port, e.g. 10202; client certificate CN is the principal")
-    parser.add_argument("--tls-cert", type=str, default="certs/gateway_cert.pem", help="Gateway certificate (PEM)")
-    parser.add_argument("--tls-key", type=str, default="certs/gateway_key.pem", help="Gateway private key (PEM)")
-    parser.add_argument("--tls-ca", type=str, default="certs/gateway_ca_cert.pem", help="CA that issues client certificates (PEM)")
+    add_common_arguments(parser, listen_port=10200, backend_port=1102, log_file="logs/s7_security_events.jsonl",
+                         policy_example="s7_policy.json",
+                         tls_port_hint="Also listen for mutual-TLS sessions (ews_tls_tunnel.py) on this port, e.g. 10202; client certificate CN is the principal")
     args = parser.parse_args()
 
     policy = load_policy(args.policy) if args.policy else {}
-    siem_udp = None
-    if args.siem_udp:
-        host, _, port = args.siem_udp.rpartition(":")
-        siem_udp = (host, int(port))
     proxy = S7DPIProxy(
-        listen_host=args.listen_host,
-        listen_port=args.listen_port,
-        backend_host=args.backend_host,
-        backend_port=args.backend_port,
-        authorized_ews_ips=args.authorized_ews or policy.get("authorized_ews_ips", ["192.168.1.50"]),
-        authorized_ews_identities=policy.get("authorized_ews_identities", []),
         open_fcs=policy.get("open_functions", OPEN_FCS),
         open_userdata=policy.get("open_userdata", OPEN_USERDATA),
         change_windows=policy.get("change_windows"),
         protected_db_words=policy.get("protected_db_words", []),
-        log_file=args.log_file,
-        enforce=policy.get("enforce", True) and not args.monitor,
-        max_sessions_per_source=policy.get("max_sessions_per_source", 8),
-        max_requests_per_second=policy.get("max_requests_per_second", 200),
-        siem_udp=siem_udp,
-        tls_port=args.tls_port,
-        tls_cert=args.tls_cert,
-        tls_key=args.tls_key,
-        tls_ca=args.tls_ca
+        **common_kwargs(args, policy)
     )
     try:
         asyncio.run(proxy.start())
