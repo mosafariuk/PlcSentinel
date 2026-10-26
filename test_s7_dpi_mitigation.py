@@ -21,7 +21,7 @@ def run_tests():
     DPI_PORT = 10200
     failures = 0
 
-    logger.info("=== STEP 1: VERIFYING TELEMETRY READ VIA S7 DPI PROXY (PORT 1020) ===")
+    logger.info("=== STEP 1: VERIFYING TELEMETRY READ VIA S7 DPI PROXY (PORT 10200) ===")
     client = Client()
     try:
         client.connect("127.0.0.1", 0, 1, tcp_port=DPI_PORT)
