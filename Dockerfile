@@ -18,6 +18,6 @@ COPY . /app
 RUN useradd --system --uid 10001 --create-home plcsentinel
 USER plcsentinel
 
-EXPOSE 5020 10200 4840 1102
+EXPOSE 5020 802 10200 10202 4840 1102
 
 CMD ["python3", "soc_dashboard.py"]

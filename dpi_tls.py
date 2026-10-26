@@ -25,13 +25,18 @@ def server_context(cert: str, key: str, ca: str) -> ssl.SSLContext:
     return ctx
 
 
-def client_context(cert: str, key: str, ca: str) -> ssl.SSLContext:
-    """TLS 1.2+ client context presenting our certificate and pinning the CA."""
+def client_context(cert: str, key: str, ca: str, check_hostname: bool = True) -> ssl.SSLContext:
+    """TLS 1.2+ client context presenting our certificate and pinning the CA.
+
+    check_hostname=False is for libraries that wrap sockets without a
+    server_hostname (pymodbus' sync TLS client); the chain is still verified
+    against the pinned CA, only the SAN binding is skipped.
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_verify_locations(ca)
     ctx.load_cert_chain(cert, key)
-    ctx.check_hostname = True
+    ctx.check_hostname = check_hostname
     ctx.verify_mode = ssl.CERT_REQUIRED
     return ctx
 
